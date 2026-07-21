@@ -10,29 +10,19 @@ import (
 
 const playgroundURL = "https://build.nvidia.com/z-ai/glm-5.2/playground"
 
-// Extract loads the NVIDIA Playground, triggers hCaptcha, and returns a
-// one-shot token from data-hcaptcha-response. Each token is valid for a
-// single upstream request.
+// Extract is a one-shot helper: start Chrome, scrape one token, shut down.
+// Prefer Browser + Pool for concurrent serving.
 func Extract(baseCtx context.Context) (string, error) {
-	allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("enable-automation", false),
-		chromedp.Flag("no-first-run", true),
-		chromedp.Flag("no-default-browser-check", true),
-		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-		chromedp.WindowSize(1280, 900),
-	)
+	b, err := NewBrowser(baseCtx)
+	if err != nil {
+		return "", err
+	}
+	defer b.Close()
+	return b.Extract(baseCtx)
+}
 
-	allocCtx, allocCancel := chromedp.NewExecAllocator(baseCtx, allocOpts...)
-	defer allocCancel()
-
-	ctx, cancel := chromedp.NewContext(allocCtx)
-	defer cancel()
-
-	ctx, cancelCtx := context.WithTimeout(ctx, 90*time.Second)
-	defer cancelCtx()
-
+// runExtract assumes ctx is already a chromedp tab context with a timeout.
+func runExtract(ctx context.Context) (string, error) {
 	var token string
 	err := chromedp.Run(ctx,
 		chromedp.Navigate(playgroundURL),

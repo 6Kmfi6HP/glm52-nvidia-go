@@ -139,19 +139,33 @@ client := glm52.New(glm52.WithCaptchaToken(token))
 上游 predict API 本身就是 Chat Completions 格式，`serve` 只做 captcha 头适配与透传。**每个 captcha token 只能用于一次上游请求。**
 
 ```bash
-# 每次请求自动提取新 token
+# 共享 Chrome + captcha 预热池（启动默认：pool=3 workers=2 coalesce=16ms，先预热再接流量）
 go run ./cmd/serve -auto -addr :8080
 
-# 或启动时提供一次性 token（首次请求后即消耗）
-go run ./cmd/serve -captcha "P1_..."
+# 覆盖默认（实验脚本 scripts/ttft_sweep.sh）
+go run ./cmd/serve -auto -pool-size=2 -pool-workers=1 -coalesce-ms=0 -max-inflight=8
+
+# 跳过启动预热（不推荐：首请求 TTFT 会含整段 captcha 提取）
+go run ./cmd/serve -auto -warm-timeout=0
 
 # 调用（与 OpenAI SDK 兼容）
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+
+# 池水位（fills/takes/ready）
+curl -s http://localhost:8080/healthz
 ```
 
-也可在请求头携带 `nv-captcha-token` 提供一次性 token。流式响应会关闭 `continuous_usage_stats`，保证 usage 只出现一次。
+也可在请求头携带 `nv-captcha-token` 提供一次性 token。流式优化：关闭 `continuous_usage_stats`、SSE 逐写 Flush、可选 content coalesce；`-auto` 时后台预热 token，请求路径只从池中取。
+
+流式时序 / 并发实验：
+
+```bash
+go run ./cmd/streambench -auto -prompt "Count from 1 to 20."
+go run ./cmd/streambench -proxy http://localhost:8080
+go run ./cmd/streambench -proxy http://localhost:8080 -concurrency 4 -max-tokens 64
+```
 
 ## 项目结构
 
@@ -159,7 +173,8 @@ curl http://localhost:8080/v1/chat/completions \
 glm52-nvidia-go/
 ├── types.go              # 类型定义（ChatRequest、Message、Chunk 等）
 ├── client.go             # 客户端实现（hCaptcha token + SSE 流式）
-├── internal/captcha/     # chromedp 提取一次性 captcha token
-├── cmd/example/          # 命令行示例
-└── cmd/serve/            # OpenAI Chat Completions 兼容代理
+├── internal/captcha/     # 共享 Chrome、token 预热池、一次性提取
+├── cmd/example/          # 命令行示例（-smooth-ms 打字机输出）
+├── cmd/serve/            # OpenAI Chat Completions 兼容代理
+└── cmd/streambench/      # SSE 时序 + 并发实验（-concurrency）
 ```

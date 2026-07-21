@@ -147,7 +147,7 @@ func (c *Client) StreamChat(ctx context.Context, messages []Message, cb func(Str
 		Stream:   true,
 		StreamOptions: &StreamOptions{
 			IncludeUsage:         true,
-			ContinuousUsageStats: true,
+			ContinuousUsageStats: false, // usage once at end — less payload / cleaner clients
 		},
 	}
 	c.applyDefaults(req)

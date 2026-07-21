@@ -16,6 +16,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"time"
 
 	glm52 "glm52-nvidia"
 )
@@ -25,6 +26,7 @@ func main() {
 	auto := flag.Bool("auto", false, "Auto-extract captcha token via chromedp")
 	prompt := flag.String("prompt", "Explain the meaning of life in one sentence.", "prompt to send")
 	stream := flag.Bool("stream", true, "use streaming")
+	smoothMs := flag.Int("smooth-ms", 12, "typewriter delay per rune for stream output (0=off)")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -57,21 +59,26 @@ func main() {
 
 	if *stream {
 		fmt.Print("\n=== Streaming response ===\n\n")
+		smooth := time.Duration(*smoothMs) * time.Millisecond
+		var lastUsage *glm52.Usage
 		err := client.StreamChat(ctx, messages, func(chunk glm52.StreamChunk) {
 			if chunk.Error != nil {
 				log.Printf("Stream error: %v", chunk.Error)
 				return
 			}
-			fmt.Print(chunk.Content)
+			writeSmooth(chunk.Content, smooth)
 			if chunk.Usage != nil {
-				fmt.Printf("\n\n[Usage: %d prompt + %d completion = %d total]\n",
-					chunk.Usage.PromptTokens, chunk.Usage.CompletionTokens, chunk.Usage.TotalTokens)
+				lastUsage = chunk.Usage
 			}
 		})
 		if err != nil {
 			log.Fatalf("Stream chat failed: %v", err)
 		}
 		fmt.Println()
+		if lastUsage != nil {
+			fmt.Printf("\n[Usage: %d prompt + %d completion = %d total]\n",
+				lastUsage.PromptTokens, lastUsage.CompletionTokens, lastUsage.TotalTokens)
+		}
 	} else {
 		resp, err := client.Chat(ctx, messages)
 		if err != nil {
