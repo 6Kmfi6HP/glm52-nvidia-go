@@ -1,0 +1,279 @@
+package glm52
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+)
+
+// --- Client ---
+
+// Client is the GLM-5.2 API client.
+type Client struct {
+	captchaToken string // reverse-engineered captcha token
+
+	// HTTP client (can be overridden)
+	httpClient *http.Client
+
+	// default request parameters
+	model     string
+	maxTokens int
+	seed      int
+	temp      float64
+	topP      float64
+}
+
+// Option configures the Client.
+type Option func(*Client)
+
+// WithCaptchaToken sets the hCaptcha token for the reverse-engineered endpoint.
+// Obtain this from the Playground page: widget's data-hcaptcha-response attribute.
+func WithCaptchaToken(token string) Option {
+	return func(c *Client) { c.captchaToken = token }
+}
+
+// WithHTTPClient overrides the default HTTP client.
+func WithHTTPClient(hc *http.Client) Option {
+	return func(c *Client) { c.httpClient = hc }
+}
+
+// WithModel overrides the model name.
+func WithModel(m string) Option {
+	return func(c *Client) { c.model = m }
+}
+
+// WithDefaults sets default request parameters.
+func WithDefaults(maxTokens int, seed int, temp, topP float64) Option {
+	return func(c *Client) {
+		c.maxTokens = maxTokens
+		c.seed = seed
+		c.temp = temp
+		c.topP = topP
+	}
+}
+
+// New creates a new GLM-5.2 client configured with an hCaptcha token.
+func New(opts ...Option) *Client {
+	c := &Client{
+		httpClient: &http.Client{Timeout: requestTimeout},
+		model:      DefaultModel,
+		maxTokens:  defaultMaxTokens,
+		seed:       defaultSeed,
+		temp:       defaultTemp,
+		topP:       defaultTopP,
+	}
+	for _, o := range opts {
+		o(c)
+	}
+	return c
+}
+
+// --- internal request helpers ---
+
+func (c *Client) buildRequest(ctx context.Context, req *ChatRequest) (*http.Request, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("glm52: marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", PredictEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("glm52: create request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("accept", "text/event-stream")
+	httpReq.Header.Set("nv-function-id", NVFunctionID)
+	httpReq.Header.Set("nv-captcha-token", c.captchaToken)
+	httpReq.Header.Set("Origin", "https://build.nvidia.com")
+	httpReq.Header.Set("Referer", "https://build.nvidia.com/")
+
+	return httpReq, nil
+}
+
+func (c *Client) applyDefaults(r *ChatRequest) {
+	if r.Model == "" {
+		r.Model = c.model
+	}
+	if r.MaxTokens == 0 {
+		r.MaxTokens = c.maxTokens
+	}
+	if r.Seed == 0 {
+		r.Seed = c.seed
+	}
+	if r.Temperature == 0 {
+		r.Temperature = c.temp
+	}
+	if r.TopP == 0 {
+		r.TopP = c.topP
+	}
+}
+
+// --- Public API ---
+
+// Chat sends a synchronous chat completion request.
+func (c *Client) Chat(ctx context.Context, messages []Message) (*ChatResponse, error) {
+	req := &ChatRequest{
+		Messages: messages,
+		Stream:   false,
+	}
+	c.applyDefaults(req)
+
+	var resp ChatResponse
+	if err := c.doRequest(ctx, req, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// StreamChunk is yielded by StreamChat.
+type StreamChunk struct {
+	Content string
+	Reason  string
+	Usage   *Usage
+	Done    bool
+	Error   error
+}
+
+// StreamChat sends a streaming chat completion. Each chunk is delivered to the callback.
+// The callback's return value controls whether streaming continues (true = continue).
+func (c *Client) StreamChat(ctx context.Context, messages []Message, cb func(StreamChunk)) error {
+	req := &ChatRequest{
+		Messages: messages,
+		Stream:   true,
+		StreamOptions: &StreamOptions{
+			IncludeUsage:         true,
+			ContinuousUsageStats: true,
+		},
+	}
+	c.applyDefaults(req)
+
+	return c.doStream(ctx, req, cb)
+}
+
+// --- Internal: doRequest (non-streaming) ---
+
+func (c *Client) doRequest(ctx context.Context, req *ChatRequest, target interface{}) error {
+	httpReq, err := c.buildRequest(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("glm52: http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read full body
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("glm52: read body: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return parseError(raw)
+	}
+
+	if err := json.Unmarshal(raw, target); err != nil {
+		return fmt.Errorf("glm52: decode response: %w", err)
+	}
+	return nil
+}
+
+// --- Internal: doStream (SSE streaming) ---
+
+func (c *Client) doStream(ctx context.Context, req *ChatRequest, cb func(StreamChunk)) error {
+	httpReq, err := c.buildRequest(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("glm52: http do: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(resp.Body)
+		return parseError(raw)
+	}
+
+	// Read SSE stream
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				cb(StreamChunk{Done: true})
+				return nil
+			}
+			return fmt.Errorf("glm52: read sse: %w", err)
+		}
+
+		line = strings.TrimSpace(line)
+
+		// Skip empty lines / comments
+		if line == "" || strings.HasPrefix(line, ":") {
+			continue
+		}
+
+		// data: [DONE]
+		if line == "data: [DONE]" {
+			cb(StreamChunk{Done: true})
+			return nil
+		}
+
+		// data: {...}
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+			var chunk ChatChunk
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				cb(StreamChunk{Error: fmt.Errorf("glm52: decode chunk: %w", err)})
+				continue
+			}
+
+			sc := StreamChunk{}
+			if len(chunk.Choices) > 0 {
+				sc.Content = chunk.Choices[0].Delta.Content
+				sc.Reason = chunk.Choices[0].Delta.Role
+			}
+			if chunk.Usage != nil {
+				sc.Usage = chunk.Usage
+			}
+			cb(sc)
+		}
+	}
+}
+
+// --- helpers ---
+
+func parseError(raw []byte) error {
+	var apiErr ErrorResponse
+	if err := json.Unmarshal(raw, &apiErr); err == nil && apiErr.RequestStatus.StatusCode != "" {
+		return &apiErr
+	}
+	// Try OpenAI error format
+	var oaiErr struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &oaiErr); err == nil && oaiErr.Error.Message != "" {
+		return fmt.Errorf("glm52: %s: %s", oaiErr.Error.Type, oaiErr.Error.Message)
+	}
+	return fmt.Errorf("glm52: http error: %s", string(raw[:min(len(raw), 300)]))
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
