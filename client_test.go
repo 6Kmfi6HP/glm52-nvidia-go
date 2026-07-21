@@ -61,3 +61,36 @@ func TestBuildRequestUsesCaptchaAuthentication(t *testing.T) {
 		t.Errorf("body messages = %#v, want %#v", got.Messages, chatRequest.Messages)
 	}
 }
+
+func TestApplyDefaultsEnablesThinking(t *testing.T) {
+	client := New(WithCaptchaToken("t"))
+	req := &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "Hi"}}}
+	client.applyDefaults(req)
+	if req.ChatTemplateKwargs["enable_thinking"] != true {
+		t.Fatalf("enable_thinking = %#v, want true", req.ChatTemplateKwargs["enable_thinking"])
+	}
+	if req.ChatTemplateKwargs["clear_thinking"] != false {
+		t.Fatalf("clear_thinking = %#v, want false", req.ChatTemplateKwargs["clear_thinking"])
+	}
+}
+
+func TestWithThinkingFalse(t *testing.T) {
+	client := New(WithCaptchaToken("t"), WithThinking(false))
+	req := &ChatRequest{Messages: []Message{{Role: RoleUser, Content: "Hi"}}}
+	client.applyDefaults(req)
+	if req.ChatTemplateKwargs != nil {
+		t.Fatalf("ChatTemplateKwargs = %#v, want nil when thinking disabled", req.ChatTemplateKwargs)
+	}
+}
+
+func TestApplyDefaultsPreservesCallerKwargs(t *testing.T) {
+	client := New(WithCaptchaToken("t"))
+	req := &ChatRequest{
+		Messages:           []Message{{Role: RoleUser, Content: "Hi"}},
+		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
+	}
+	client.applyDefaults(req)
+	if req.ChatTemplateKwargs["enable_thinking"] != false {
+		t.Fatalf("got %#v", req.ChatTemplateKwargs)
+	}
+}

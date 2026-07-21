@@ -97,9 +97,9 @@ func TestUpstreamRetryOnInvalidToken(t *testing.T) {
 	}
 }
 
-func TestNormalizeUsageOnce(t *testing.T) {
+func TestNormalizeRequestBody(t *testing.T) {
 	in := []byte(`{"stream":true,"messages":[]}`)
-	out, err := normalizeUsageOnce(in)
+	out, err := normalizeRequestBody(in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,5 +110,25 @@ func TestNormalizeUsageOnce(t *testing.T) {
 	opts := raw["stream_options"].(map[string]any)
 	if opts["continuous_usage_stats"] != false {
 		t.Fatalf("got %#v", opts["continuous_usage_stats"])
+	}
+	kw := raw["chat_template_kwargs"].(map[string]any)
+	if kw["enable_thinking"] != true || kw["clear_thinking"] != false {
+		t.Fatalf("thinking kwargs = %#v", kw)
+	}
+}
+
+func TestNormalizeRequestBodyPreservesThinking(t *testing.T) {
+	in := []byte(`{"stream":false,"chat_template_kwargs":{"enable_thinking":false}}`)
+	out, err := normalizeRequestBody(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(out, &raw); err != nil {
+		t.Fatal(err)
+	}
+	kw := raw["chat_template_kwargs"].(map[string]any)
+	if kw["enable_thinking"] != false {
+		t.Fatalf("should preserve caller kwargs, got %#v", kw)
 	}
 }

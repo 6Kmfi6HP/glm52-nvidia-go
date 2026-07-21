@@ -218,7 +218,8 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 
 	// Normalize stream_options so usage is reported once (OpenAI-compatible).
-	body, err = normalizeUsageOnce(body)
+	// Inject Playground-default thinking kwargs when the client omitted them.
+	body, err = normalizeRequestBody(body)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, "invalid json body")
 		return
@@ -370,16 +371,23 @@ func (s *server) resolveCaptcha(ctx context.Context, clientToken string, allowFl
 	return "", fmt.Errorf("captcha token required: send nv-captcha-token, or restart with -captcha / -auto")
 }
 
-// normalizeUsageOnce forces continuous_usage_stats=false so token usage
-// appears at most once in the stream (final chunk when include_usage is set).
-func normalizeUsageOnce(body []byte) ([]byte, error) {
+// normalizeRequestBody applies Playground-compatible defaults:
+// - stream: force continuous_usage_stats=false (usage once at end)
+// - thinking: inject chat_template_kwargs when omitted
+func normalizeRequestBody(body []byte) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
+	if _, ok := raw["chat_template_kwargs"]; !ok {
+		raw["chat_template_kwargs"] = map[string]any{
+			"enable_thinking": true,
+			"clear_thinking":  false,
+		}
+	}
 	stream, _ := raw["stream"].(bool)
 	if !stream {
-		return body, nil
+		return json.Marshal(raw)
 	}
 	opts, _ := raw["stream_options"].(map[string]any)
 	if opts == nil {

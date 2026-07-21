@@ -61,12 +61,26 @@ func main() {
 		fmt.Print("\n=== Streaming response ===\n\n")
 		smooth := time.Duration(*smoothMs) * time.Millisecond
 		var lastUsage *glm52.Usage
+		var reasoningStarted, contentStarted bool
 		err := client.StreamChat(ctx, messages, func(chunk glm52.StreamChunk) {
 			if chunk.Error != nil {
 				log.Printf("Stream error: %v", chunk.Error)
 				return
 			}
-			writeSmooth(chunk.Content, smooth)
+			if chunk.Reasoning != "" {
+				if !reasoningStarted {
+					fmt.Print("--- thinking ---\n")
+					reasoningStarted = true
+				}
+				writeSmooth(chunk.Reasoning, smooth)
+			}
+			if chunk.Content != "" {
+				if reasoningStarted && !contentStarted {
+					fmt.Print("\n--- answer ---\n")
+					contentStarted = true
+				}
+				writeSmooth(chunk.Content, smooth)
+			}
 			if chunk.Usage != nil {
 				lastUsage = chunk.Usage
 			}
@@ -86,7 +100,11 @@ func main() {
 		}
 		fmt.Print("\n=== Response ===\n\n")
 		if len(resp.Choices) > 0 {
-			fmt.Println(resp.Choices[0].Message.Content)
+			msg := resp.Choices[0].Message
+			if msg.ReasoningContent != "" {
+				fmt.Printf("--- thinking ---\n%s\n\n--- answer ---\n", msg.ReasoningContent)
+			}
+			fmt.Println(msg.Content)
 		}
 		if resp.Usage != nil {
 			fmt.Printf("\n[Usage: %d prompt + %d completion = %d total]\n",

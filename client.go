@@ -26,6 +26,9 @@ type Client struct {
 	seed      int
 	temp      float64
 	topP      float64
+
+	// thinking mirrors Playground: chat_template_kwargs.enable_thinking
+	thinking *bool
 }
 
 // Option configures the Client.
@@ -55,6 +58,13 @@ func WithDefaults(maxTokens int, seed int, temp, topP float64) Option {
 		c.temp = temp
 		c.topP = topP
 	}
+}
+
+// WithThinking enables or disables GLM Thinking mode (reasoning_content).
+// Matches NVIDIA Playground / NIM: chat_template_kwargs.enable_thinking.
+// Default when unset: enabled (true), clear_thinking=false.
+func WithThinking(enable bool) Option {
+	return func(c *Client) { c.thinking = &enable }
 }
 
 // New creates a new GLM-5.2 client configured with an hCaptcha token.
@@ -111,6 +121,18 @@ func (c *Client) applyDefaults(r *ChatRequest) {
 	if r.TopP == 0 {
 		r.TopP = c.topP
 	}
+	if r.ChatTemplateKwargs == nil {
+		enable := true
+		if c.thinking != nil {
+			enable = *c.thinking
+		}
+		if enable {
+			r.ChatTemplateKwargs = map[string]any{
+				"enable_thinking": true,
+				"clear_thinking":  false,
+			}
+		}
+	}
 }
 
 // --- Public API ---
@@ -132,11 +154,11 @@ func (c *Client) Chat(ctx context.Context, messages []Message) (*ChatResponse, e
 
 // StreamChunk is yielded by StreamChat.
 type StreamChunk struct {
-	Content string
-	Reason  string
-	Usage   *Usage
-	Done    bool
-	Error   error
+	Content   string
+	Reasoning string // delta.reasoning_content when Thinking is on
+	Usage     *Usage
+	Done      bool
+	Error     error
 }
 
 // StreamChat sends a streaming chat completion. Each chunk is delivered to the callback.
@@ -241,7 +263,7 @@ func (c *Client) doStream(ctx context.Context, req *ChatRequest, cb func(StreamC
 			sc := StreamChunk{}
 			if len(chunk.Choices) > 0 {
 				sc.Content = chunk.Choices[0].Delta.Content
-				sc.Reason = chunk.Choices[0].Delta.Role
+				sc.Reasoning = chunk.Choices[0].Delta.ReasoningContent
 			}
 			if chunk.Usage != nil {
 				sc.Usage = chunk.Usage

@@ -52,7 +52,7 @@ Referer: https://build.nvidia.com/
 
 ### 请求体格式
 
-兼容 OpenAI Chat Completions 格式：
+兼容 OpenAI Chat Completions 格式。Playground 开启 Thinking 时额外携带 `chat_template_kwargs`：
 
 ```json
 {
@@ -68,21 +68,27 @@ Referer: https://build.nvidia.com/
   "stream_options": {
     "include_usage": true,
     "continuous_usage_stats": true
+  },
+  "chat_template_kwargs": {
+    "enable_thinking": true,
+    "clear_thinking": false
   }
 }
 ```
+
+`enable_thinking: true` 时上游在 SSE `delta` / 非流式 `message` 中返回 `reasoning_content`（思维链），再返回 `content`（最终回答）。`clear_thinking: false` 表示多轮对话保留历史思考内容。
 
 ### 响应体格式
 
 标准 SSE 流：
 
 ```
-data: {"id":"chatcmpl-xxx","choices":[{"index":0,"delta":{"content":"你好","role":"assistant"},"finish_reason":null}],"created":...,"model":"z-ai/glm-5.2","object":"chat.completion.chunk","usage":null}
-data: {"id":"chatcmpl-xxx","choices":[{"index":0,"delta":{"content":"!","role":"assistant"},"finish_reason":null}],...}
+data: {"id":"chatcmpl-xxx","choices":[{"index":0,"delta":{"reasoning_content":"...","role":"assistant"},"finish_reason":null}],...}
+data: {"id":"chatcmpl-xxx","choices":[{"index":0,"delta":{"content":"你好","role":"assistant"},"finish_reason":null}],...}
 data: [DONE]
 ```
 
-支持 `reasoning_content` 字段（开启 Thinking 模式时）。
+开启 Thinking 时先出现 `reasoning_content`，再出现 `content`。
 
 ## Go 客户端使用
 
@@ -148,10 +154,15 @@ go run ./cmd/serve -auto -pool-size=2 -pool-workers=1 -coalesce-ms=0 -max-inflig
 # 跳过启动预热（不推荐：首请求 TTFT 会含整段 captcha 提取）
 go run ./cmd/serve -auto -warm-timeout=0
 
-# 调用（与 OpenAI SDK 兼容）
+# 调用（与 OpenAI SDK 兼容；serve 默认注入 enable_thinking，与 Playground 一致）
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+  -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"Which is larger, 9.11 or 9.8?"}],"stream":true}'
+
+# 显式关闭思维链
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"Hi"}],"stream":true,"chat_template_kwargs":{"enable_thinking":false}}'
 
 # 池水位（fills/takes/ready）
 curl -s http://localhost:8080/healthz

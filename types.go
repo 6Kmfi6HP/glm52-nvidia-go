@@ -27,9 +27,11 @@ const (
 )
 
 // Message represents a single chat message.
+// When Thinking is enabled, assistant deltas/messages may include ReasoningContent.
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 }
 
 // ChatRequest is the request body sent to the predict API.
