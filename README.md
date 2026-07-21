@@ -134,13 +134,32 @@ client := glm52.New(glm52.WithCaptchaToken(token))
 | API 兼容 | OpenAI Chat Completions 格式 |
 | 部署 | Docker NIM: `nvcr.io/nim/zai-org/glm-5.2:latest` |
 
+### 方式 3：OpenAI 兼容本地代理
+
+上游 predict API 本身就是 Chat Completions 格式，`serve` 只做 captcha 头适配与透传。**每个 captcha token 只能用于一次上游请求。**
+
+```bash
+# 每次请求自动提取新 token
+go run ./cmd/serve -auto -addr :8080
+
+# 或启动时提供一次性 token（首次请求后即消耗）
+go run ./cmd/serve -captcha "P1_..."
+
+# 调用（与 OpenAI SDK 兼容）
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+```
+
+也可在请求头携带 `nv-captcha-token` 提供一次性 token。流式响应会关闭 `continuous_usage_stats`，保证 usage 只出现一次。
+
 ## 项目结构
 
 ```
 glm52-nvidia-go/
-├── types.go        # 类型定义（ChatRequest、Message、Chunk 等）
-├── client.go       # 客户端实现（hCaptcha token + SSE 流式）
-└── cmd/example/
-    ├── main.go     # 命令行示例
-    └── auto.go     # chromedp 自动提取 token（需 go get chromedp）
+├── types.go              # 类型定义（ChatRequest、Message、Chunk 等）
+├── client.go             # 客户端实现（hCaptcha token + SSE 流式）
+├── internal/captcha/     # chromedp 提取一次性 captcha token
+├── cmd/example/          # 命令行示例
+└── cmd/serve/            # OpenAI Chat Completions 兼容代理
 ```
