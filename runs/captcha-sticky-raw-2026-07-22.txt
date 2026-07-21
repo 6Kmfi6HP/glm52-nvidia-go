@@ -1,0 +1,58 @@
+captchaopt: runs=4 skip-api=false variants=[nav_each sticky_exec sticky_reset userdata_nav]
+
+=== variant nav_each ===
+  trial 1 (cold): extract=90003ms api=0ms api_ok=false (context deadline exceeded)
+  trial 2 (cold): extract=90001ms api=0ms api_ok=false (context deadline exceeded)
+  trial 3 (cold): extract=90000ms api=0ms api_ok=false (context deadline exceeded)
+  trial 4 (cold): extract=90001ms api=0ms api_ok=false (context deadline exceeded)
+
+=== variant sticky_exec ===
+2026/07/22 04:24:56 ERROR: unhandled node event *dom.EventTopLayerElementsUpdated
+2026/07/22 04:24:56 ERROR: unhandled node event *dom.EventTopLayerElementsUpdated
+  trial 1 (cold): extract=6243ms api=3045ms api_ok=true (ok)
+  trial 2 (steady): extract=315ms api=4059ms api_ok=true (ok)
+  trial 3 (steady): extract=484ms api=5890ms api_ok=true (ok)
+  trial 4 (steady): extract=341ms api=3577ms api_ok=true (ok)
+
+=== variant sticky_reset ===
+2026/07/22 04:25:28 ERROR: unhandled node event *dom.EventTopLayerElementsUpdated
+2026/07/22 04:25:28 ERROR: unhandled node event *dom.EventTopLayerElementsUpdated
+  trial 1 (cold): extract=5800ms api=805ms api_ok=true (ok)
+  trial 2 (steady): extract=314ms api=3238ms api_ok=true (ok)
+  trial 3 (steady): extract=475ms api=2506ms api_ok=true (ok)
+  trial 4 (steady): extract=326ms api=2435ms api_ok=true (ok)
+
+=== variant userdata_nav ===
+  trial 1 (cold): extract=90002ms api=0ms api_ok=false (context deadline exceeded)
+  trial 2 (cold): extract=90001ms api=0ms api_ok=false (context deadline exceeded)
+  trial 3 (cold): extract=90001ms api=0ms api_ok=false (context deadline exceeded)
+  trial 4 (cold): extract=90004ms api=0ms api_ok=false (context deadline exceeded)
+
+=== summary ===
+variant           med_all   med_steady  api_ok%    med_api
+nav_each                0            0       0%          0
+sticky_exec           412          341     100%       3818
+sticky_reset          400          326     100%       2470
+userdata_nav            0            0       0%          0
+
+best (100% api_ok, lowest med_steady): sticky_reset (326ms)
+captchaopt: runs=3 skip-api=false variants=[nav_each sticky_reset]
+
+=== variant nav_each ===
+  trial 1 (cold): extract=90003ms api=0ms api_ok=false (context deadline exceeded)
+  trial 2 (cold): extract=90000ms api=0ms api_ok=false (context deadline exceeded)
+  trial 3 (cold): extract=90002ms api=0ms api_ok=false (context deadline exceeded)
+
+=== variant sticky_reset ===
+2026/07/22 04:36:54 ERROR: unhandled node event *dom.EventTopLayerElementsUpdated
+2026/07/22 04:36:54 ERROR: unhandled node event *dom.EventTopLayerElementsUpdated
+  trial 1 (cold): extract=6029ms api=4711ms api_ok=true (ok)
+  trial 2 (steady): extract=317ms api=4412ms api_ok=true (ok)
+  trial 3 (steady): extract=477ms api=7832ms api_ok=true (ok)
+
+=== summary ===
+variant           med_all   med_steady  api_ok%    med_api
+nav_each                0            0       0%          0
+sticky_reset          477          397     100%       4711
+
+best (100% api_ok, lowest med_steady): sticky_reset (397ms)

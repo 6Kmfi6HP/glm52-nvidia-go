@@ -1,0 +1,36 @@
+captchaopt: runs=2 skip-api=false variants=[baseline fast_wait block_urls block+fast fetch+fast all]
+
+=== variant baseline ===
+  trial 1: extract=9742ms api=12851ms api_ok=true (ok)
+  trial 2: extract=10646ms api=18413ms api_ok=true (ok)
+
+=== variant fast_wait ===
+  trial 1: extract=7981ms api=20329ms api_ok=true (ok)
+  trial 2: extract=8260ms api=16490ms api_ok=true (ok)
+
+=== variant block_urls ===
+  trial 1: extract=8006ms api=10260ms api_ok=true (ok)
+  trial 2: extract=7625ms api=9011ms api_ok=true (ok)
+
+=== variant block+fast ===
+  trial 1: extract=6979ms api=11536ms api_ok=true (ok)
+  trial 2: extract=6713ms api=8792ms api_ok=true (ok)
+
+=== variant fetch+fast ===
+  trial 1: extract=7211ms api=12105ms api_ok=true (ok)
+  trial 2: extract=7136ms api=7816ms api_ok=true (ok)
+
+=== variant all ===
+  trial 1: extract=7211ms api=14928ms api_ok=true (ok)
+  trial 2: extract=7523ms api=11678ms api_ok=true (ok)
+
+=== summary (median extract_ms among successful extracts) ===
+variant      med_ext_ms  api_ok% med_api_ms
+baseline          10194     100%      15632
+fast_wait          8120     100%      18410
+block_urls         7816     100%       9636
+block+fast         6846     100%      10164
+fetch+fast         7174     100%       9960
+all                7367     100%      13303
+
+best (100% api_ok, lowest med extract): block+fast (6846ms)
