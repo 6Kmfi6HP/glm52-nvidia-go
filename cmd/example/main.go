@@ -87,11 +87,3 @@ func main() {
 		}
 	}
 }
-
-// extractCaptchaToken loads the NVIDIA Playground in a headless Chrome,
-// waits for hCaptcha to generate a token, and returns it.
-// Requires chromedp: go get -u github.com/chromedp/chromedp
-func extractCaptchaToken(ctx context.Context) (string, error) {
-	return "", fmt.Errorf("auto-extract requires chromedp: go get github.com/chromedp/chromedp\n" +
-		"See cmd/example/auto.go for the full implementation")
-}
