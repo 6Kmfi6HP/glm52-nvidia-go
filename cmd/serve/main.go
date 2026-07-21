@@ -38,6 +38,9 @@ import (
 	"glm52-nvidia/internal/captcha"
 )
 
+// Set via -ldflags "-X main.version=v1.2.3" at release build time.
+var version = "dev"
+
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	captchaFlag := flag.String("captcha", "", "one-shot hCaptcha token (consumed on first use)")
@@ -124,8 +127,8 @@ func main() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("OpenAI-compatible proxy listening on http://localhost%s/v1/chat/completions (coalesce=%s max-inflight=%d)",
-		*addr, s.coalesce, *maxInflight)
+	log.Printf("serve %s listening on http://localhost%s/v1/chat/completions (coalesce=%s max-inflight=%d)",
+		version, *addr, s.coalesce, *maxInflight)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}

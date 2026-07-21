@@ -3,6 +3,7 @@ package captcha
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -20,6 +21,10 @@ type Browser struct {
 }
 
 // NewBrowser starts a shared Chrome allocator. Call Close when done.
+//
+// Container hints:
+//   - CHROME_PATH: absolute path to chromium/chrome binary
+//   - CHROMEDP_NO_SANDBOX=1: add --no-sandbox and --disable-dev-shm-usage
 func NewBrowser(parent context.Context) (*Browser, error) {
 	allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
@@ -30,6 +35,15 @@ func NewBrowser(parent context.Context) (*Browser, error) {
 		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
 		chromedp.WindowSize(1280, 900),
 	)
+	if path := os.Getenv("CHROME_PATH"); path != "" {
+		allocOpts = append(allocOpts, chromedp.ExecPath(path))
+	}
+	if os.Getenv("CHROMEDP_NO_SANDBOX") == "1" {
+		allocOpts = append(allocOpts,
+			chromedp.Flag("no-sandbox", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
+		)
+	}
 
 	allocCtx, cancel := chromedp.NewExecAllocator(parent, allocOpts...)
 	b := &Browser{allocCtx: allocCtx, cancel: cancel}

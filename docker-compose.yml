@@ -1,0 +1,12 @@
+services:
+  serve:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: glm52-nvidia-go:local
+    ports:
+      - "8080:8080"
+    shm_size: "2gb"
+    restart: unless-stopped
+    command: ["-auto", "-addr", ":8080"]

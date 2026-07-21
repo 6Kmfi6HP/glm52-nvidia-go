@@ -178,6 +178,42 @@ go run ./cmd/streambench -proxy http://localhost:8080
 go run ./cmd/streambench -proxy http://localhost:8080 -concurrency 4 -max-tokens 64
 ```
 
+## Docker 部署（方案 A：Chromium + serve）
+
+镜像内置 Chromium，默认以 `-auto` 启动 captcha 预热池。
+
+```bash
+# 本地构建并运行（需要 2GB shm，供 headless Chrome 使用）
+docker compose up --build
+
+# 或直接跑已发布镜像（GHCR，需先发版）
+docker run --rm -p 8080:8080 --shm-size=2g \
+  ghcr.io/6kmfi6hp/glm52-nvidia-go:latest
+```
+
+健康检查：`GET /healthz`。反向代理流式接口时请关闭 buffering，并拉长 read timeout。
+
+环境变量：
+
+| 变量 | 作用 |
+|------|------|
+| `CHROME_PATH` | Chromium 可执行文件路径（镜像内默认 `/usr/bin/chromium`） |
+| `CHROMEDP_NO_SANDBOX` | 设为 `1` 时启用 `--no-sandbox` / `--disable-dev-shm-usage`（镜像默认开启） |
+
+## 发版与镜像
+
+推送 semver tag 后，GitHub Actions 会自动：
+
+1. 构建多平台 `serve` 二进制并创建 GitHub Release
+2. 推送多架构镜像到 `ghcr.io/6kmfi6hp/glm52-nvidia-go`（`v*` + `latest`）
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+也可在 Actions 里用 `workflow_dispatch` 手动指定 tag。首次拉取私有/受限 GHCR 包时，在仓库 Settings → Packages 中确认可见性。
+
 ## 项目结构
 
 ```
@@ -187,5 +223,7 @@ glm52-nvidia-go/
 ├── internal/captcha/     # 共享 Chrome、token 预热池、一次性提取
 ├── cmd/example/          # 命令行示例（-smooth-ms 打字机输出）
 ├── cmd/serve/            # OpenAI Chat Completions 兼容代理
-└── cmd/streambench/      # SSE 时序 + 并发实验（-concurrency）
+├── cmd/streambench/      # SSE 时序 + 并发实验（-concurrency）
+├── Dockerfile            # Chromium + serve 多阶段构建
+└── docker-compose.yml    # 本地一键启动（shm_size=2g）
 ```

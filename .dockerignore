@@ -1,0 +1,11 @@
+.git
+.github
+.claude
+.DS_Store
+*.md
+runs
+scripts
+**/*_test.go
+*.exe
+*.test
+*.out
