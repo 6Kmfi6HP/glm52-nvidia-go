@@ -157,7 +157,7 @@ curl http://localhost:8080/v1/chat/completions \
 curl -s http://localhost:8080/healthz
 ```
 
-也可在请求头携带 `nv-captcha-token` 提供一次性 token。流式优化：关闭 `continuous_usage_stats`、SSE 逐写 Flush、可选 content coalesce；`-auto` 时后台预热 token，请求路径只从池中取。
+也可在请求头携带 `nv-captcha-token` 提供一次性 token。流式优化：关闭 `continuous_usage_stats`、SSE 逐写 Flush、可选 content coalesce；`-auto` 时后台预热 token，请求路径只从池中取。池内 token 默认 **90s TTL**，过期丢弃；上游返回 `Token is invalid` 时自动换新 token 最多重试 2 次。
 
 流式时序 / 并发实验：
 

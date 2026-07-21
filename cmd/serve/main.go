@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,8 +45,10 @@ func main() {
 	poolSize := flag.Int("pool-size", 3, "ready captcha tokens to keep buffered (-auto)")
 	poolWorkers := flag.Int("pool-workers", 2, "concurrent captcha extractors (-auto)")
 	maxInflight := flag.Int("max-inflight", 4, "max concurrent upstream streams (0=unlimited)")
+	inflightWait := flag.Duration("inflight-wait", 500*time.Millisecond, "how long to wait for an in-flight slot before returning 503 (0=reject immediately)")
 	coalesceMs := flag.Int("coalesce-ms", 16, "merge consecutive SSE content deltas within this window (0=off); first token always flushes immediately")
 	warmTimeout := flag.Duration("warm-timeout", 3*time.Minute, "wait for at least one pooled captcha before serving (-auto); 0=skip")
+	poolTTL := flag.Duration("pool-ttl", 90*time.Second, "discard pooled captcha tokens older than this (-auto)")
 	flag.Parse()
 
 	if !*auto && *captchaFlag == "" {
@@ -72,10 +75,11 @@ func main() {
 	defer stop()
 
 	s := &server{
-		auto:        *auto,
-		flagCaptcha: *captchaFlag,
-		coalesce:    time.Duration(*coalesceMs) * time.Millisecond,
-		httpClient:  &http.Client{Timeout: 0, Transport: transport},
+		auto:         *auto,
+		flagCaptcha:  *captchaFlag,
+		coalesce:     time.Duration(*coalesceMs) * time.Millisecond,
+		inflightWait: *inflightWait,
+		httpClient:   &http.Client{Timeout: 0, Transport: transport},
 	}
 	if *maxInflight > 0 {
 		s.inflight = make(chan struct{}, *maxInflight)
@@ -90,12 +94,13 @@ func main() {
 		s.pool = captcha.NewPool(ctx, browser.Extract, captcha.PoolConfig{
 			Size:    *poolSize,
 			Workers: *poolWorkers,
+			TTL:     *poolTTL,
 		})
 		defer func() {
 			s.pool.Close()
 			s.browser.Close()
 		}()
-		log.Printf("captcha pool: size=%d workers=%d", *poolSize, *poolWorkers)
+		log.Printf("captcha pool: size=%d workers=%d ttl=%s", *poolSize, *poolWorkers, *poolTTL)
 
 		if *warmTimeout > 0 {
 			log.Printf("warming captcha pool (timeout=%s)…", *warmTimeout)
@@ -127,10 +132,11 @@ func main() {
 }
 
 type server struct {
-	auto       bool
-	coalesce   time.Duration
-	httpClient *http.Client
-	inflight   chan struct{} // nil = unlimited
+	auto         bool
+	coalesce     time.Duration
+	httpClient   *http.Client
+	inflight     chan struct{} // nil = unlimited
+	inflightWait time.Duration // how long to wait for a slot before 503 (0=reject now)
 
 	browser *captcha.Browser
 	pool    *captcha.Pool
@@ -142,12 +148,13 @@ type server struct {
 func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	out := map[string]any{"ok": true}
 	if s.pool != nil {
-		fills, takes, errs := s.pool.Stats()
+		fills, takes, errs, expired := s.pool.Stats()
 		out["pool"] = map[string]any{
-			"ready":  s.pool.Ready(),
-			"fills":  fills,
-			"takes":  takes,
-			"errors": errs,
+			"ready":   s.pool.Ready(),
+			"fills":   fills,
+			"takes":   takes,
+			"errors":  errs,
+			"expired": expired,
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -175,12 +182,31 @@ func waitPoolReady(ctx context.Context, pool *captcha.Pool, want int, timeout ti
 
 func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if s.inflight != nil {
-		select {
-		case s.inflight <- struct{}{}:
-			defer func() { <-s.inflight }()
-		default:
-			httpError(w, http.StatusServiceUnavailable, "max in-flight upstream streams reached; retry later")
-			return
+		// Wait up to inflightWait for a slot instead of rejecting immediately;
+		// an SSE burst that would otherwise 503 can usually drain within a few
+		// hundred ms as in-flight streams finish. 0 keeps the old hard-reject.
+		if s.inflightWait <= 0 {
+			select {
+			case s.inflight <- struct{}{}:
+				defer func() { <-s.inflight }()
+			default:
+				httpError(w, http.StatusServiceUnavailable, "max in-flight upstream streams reached; retry later")
+				return
+			}
+		} else {
+			timer := time.NewTimer(s.inflightWait)
+			select {
+			case s.inflight <- struct{}{}:
+				timer.Stop()
+				defer func() { <-s.inflight }()
+			case <-timer.C:
+				httpError(w, http.StatusServiceUnavailable, "max in-flight upstream streams reached; retry later")
+				return
+			case <-r.Context().Done():
+				timer.Stop()
+				httpError(w, http.StatusServiceUnavailable, "client cancelled before a stream slot opened")
+				return
+			}
 		}
 	}
 
@@ -198,27 +224,65 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := s.resolveCaptcha(r.Context(), r)
-	if err != nil {
-		httpError(w, http.StatusUnauthorized, err.Error())
-		return
+	clientToken := r.Header.Get("nv-captcha-token")
+	// Client-supplied tokens are not retried (caller owns them). Pool/auto can refresh.
+	maxAttempts := 1
+	if clientToken == "" && (s.pool != nil || s.auto) {
+		maxAttempts = 3
 	}
 
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, glm52.PredictEndpoint, bytes.NewReader(body))
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "failed to create upstream request")
+	var upResp *http.Response
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		token, err := s.resolveCaptcha(r.Context(), clientToken, attempt == 1)
+		if err != nil {
+			httpError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+
+		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, glm52.PredictEndpoint, bytes.NewReader(body))
+		if err != nil {
+			httpError(w, http.StatusInternalServerError, "failed to create upstream request")
+			return
+		}
+		upReq.Header.Set("Content-Type", "application/json")
+		upReq.Header.Set("Accept", "text/event-stream")
+		upReq.Header.Set("nv-function-id", glm52.NVFunctionID)
+		upReq.Header.Set("nv-captcha-token", token)
+		upReq.Header.Set("Origin", "https://build.nvidia.com")
+		upReq.Header.Set("Referer", "https://build.nvidia.com/")
+
+		upResp, err = s.httpClient.Do(upReq)
+		if err != nil {
+			httpError(w, http.StatusBadGateway, fmt.Sprintf("upstream: %v", err))
+			return
+		}
+
+		if upResp.StatusCode < 400 {
+			break
+		}
+
+		raw, _ := io.ReadAll(io.LimitReader(upResp.Body, 4<<10))
+		_ = upResp.Body.Close()
+		upResp = nil
+
+		if isInvalidCaptchaToken(raw) && attempt < maxAttempts {
+			log.Printf("upstream captcha invalid (attempt %d/%d); fetching a fresh token", attempt, maxAttempts)
+			continue
+		}
+
+		if isInvalidCaptchaToken(raw) {
+			httpError(w, http.StatusUnauthorized, "captcha token invalid or expired; retry the request")
+			return
+		}
+		msg := strings.TrimSpace(string(raw))
+		if msg == "" {
+			msg = "upstream request failed"
+		}
+		httpError(w, http.StatusBadGateway, msg)
 		return
 	}
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("Accept", "text/event-stream")
-	upReq.Header.Set("nv-function-id", glm52.NVFunctionID)
-	upReq.Header.Set("nv-captcha-token", token) // one captcha → one upstream call
-	upReq.Header.Set("Origin", "https://build.nvidia.com")
-	upReq.Header.Set("Referer", "https://build.nvidia.com/")
-
-	upResp, err := s.httpClient.Do(upReq)
-	if err != nil {
-		httpError(w, http.StatusBadGateway, fmt.Sprintf("upstream: %v", err))
+	if upResp == nil {
+		httpError(w, http.StatusUnauthorized, "captcha token invalid or expired; retry the request")
 		return
 	}
 	defer upResp.Body.Close()
@@ -235,6 +299,25 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err := coalesceSSE(w, upResp.Body, s.coalesce); err != nil && r.Context().Err() == nil {
 		log.Printf("stream copy: %v", err)
 	}
+}
+
+// isInvalidCaptchaToken detects NVIDIA's "Token is invalid" captcha failures.
+func isInvalidCaptchaToken(raw []byte) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var er glm52.ErrorResponse
+	if json.Unmarshal(raw, &er) == nil {
+		desc := strings.ToLower(er.RequestStatus.StatusDescription)
+		if strings.Contains(desc, "token is invalid") || strings.Contains(desc, "invalid token") {
+			return true
+		}
+		if er.RequestStatus.StatusCode == "INVALID_REQUEST" && strings.Contains(desc, "token") {
+			return true
+		}
+	}
+	low := strings.ToLower(string(raw))
+	return strings.Contains(low, "token is invalid")
 }
 
 // pipeSSE copies upstream bytes to the client, flushing after each write so
@@ -261,26 +344,27 @@ func pipeSSE(w http.ResponseWriter, src io.Reader) error {
 	}
 }
 
-func (s *server) resolveCaptcha(ctx context.Context, r *http.Request) (string, error) {
-	if t := r.Header.Get("nv-captcha-token"); t != "" {
-		return t, nil
+func (s *server) resolveCaptcha(ctx context.Context, clientToken string, allowFlag bool) (string, error) {
+	if clientToken != "" {
+		return clientToken, nil
 	}
 
-	s.mu.Lock()
-	flagToken := s.flagCaptcha
-	if flagToken != "" {
-		s.flagCaptcha = "" // consume once — token is single-use upstream
-	}
-	s.mu.Unlock()
-	if flagToken != "" {
-		return flagToken, nil
+	if allowFlag {
+		s.mu.Lock()
+		flagToken := s.flagCaptcha
+		if flagToken != "" {
+			s.flagCaptcha = "" // consume once — token is single-use upstream
+		}
+		s.mu.Unlock()
+		if flagToken != "" {
+			return flagToken, nil
+		}
 	}
 
 	if s.pool != nil {
 		return s.pool.Take(ctx)
 	}
 	if s.auto {
-		// Fallback if pool failed to start (should not happen).
 		return captcha.Extract(ctx)
 	}
 	return "", fmt.Errorf("captcha token required: send nv-captcha-token, or restart with -captcha / -auto")
