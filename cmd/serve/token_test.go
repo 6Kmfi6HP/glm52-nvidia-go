@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -117,6 +118,27 @@ func TestNormalizeRequestBody(t *testing.T) {
 	}
 }
 
+func TestNormalizeRequestBodyEmptyOrNullKwargs(t *testing.T) {
+	cases := []string{
+		`{"stream":false,"chat_template_kwargs":{}}`,
+		`{"stream":false,"chat_template_kwargs":null}`,
+	}
+	for _, in := range cases {
+		out, err := normalizeRequestBody([]byte(in))
+		if err != nil {
+			t.Fatalf("in=%s: %v", in, err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(out, &raw); err != nil {
+			t.Fatal(err)
+		}
+		kw := raw["chat_template_kwargs"].(map[string]any)
+		if kw["enable_thinking"] != true || kw["clear_thinking"] != false {
+			t.Fatalf("in=%s thinking kwargs = %#v", in, kw)
+		}
+	}
+}
+
 func TestNormalizeRequestBodyPreservesThinking(t *testing.T) {
 	in := []byte(`{"stream":false,"chat_template_kwargs":{"enable_thinking":false}}`)
 	out, err := normalizeRequestBody(in)
@@ -131,4 +153,25 @@ func TestNormalizeRequestBodyPreservesThinking(t *testing.T) {
 	if kw["enable_thinking"] != false {
 		t.Fatalf("should preserve caller kwargs, got %#v", kw)
 	}
+}
+
+func TestAcquireInflight(t *testing.T) {
+	s := &server{
+		inflight:     make(chan struct{}, 1),
+		inflightWait: 0,
+	}
+	rel1, err := s.acquireInflight(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.acquireInflight(context.Background())
+	if err == nil {
+		t.Fatal("expected full")
+	}
+	rel1()
+	rel2, err := s.acquireInflight(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel2()
 }

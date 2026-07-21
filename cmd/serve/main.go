@@ -181,35 +181,6 @@ func waitPoolReady(ctx context.Context, pool *captcha.Pool, want int, timeout ti
 }
 
 func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	if s.inflight != nil {
-		// Wait up to inflightWait for a slot instead of rejecting immediately;
-		// an SSE burst that would otherwise 503 can usually drain within a few
-		// hundred ms as in-flight streams finish. 0 keeps the old hard-reject.
-		if s.inflightWait <= 0 {
-			select {
-			case s.inflight <- struct{}{}:
-				defer func() { <-s.inflight }()
-			default:
-				httpError(w, http.StatusServiceUnavailable, "max in-flight upstream streams reached; retry later")
-				return
-			}
-		} else {
-			timer := time.NewTimer(s.inflightWait)
-			select {
-			case s.inflight <- struct{}{}:
-				timer.Stop()
-				defer func() { <-s.inflight }()
-			case <-timer.C:
-				httpError(w, http.StatusServiceUnavailable, "max in-flight upstream streams reached; retry later")
-				return
-			case <-r.Context().Done():
-				timer.Stop()
-				httpError(w, http.StatusServiceUnavailable, "client cancelled before a stream slot opened")
-				return
-			}
-		}
-	}
-
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
 		httpError(w, http.StatusBadRequest, "failed to read body")
@@ -232,6 +203,15 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		maxAttempts = 3
 	}
 
+	// Hold an in-flight slot only while an upstream request/stream is active —
+	// not during captcha extract/Take, which can block for tens of seconds.
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+
 	var upResp *http.Response
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		token, err := s.resolveCaptcha(r.Context(), clientToken, attempt == 1)
@@ -239,6 +219,13 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusUnauthorized, err.Error())
 			return
 		}
+
+		rel, err := s.acquireInflight(r.Context())
+		if err != nil {
+			httpError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		release = rel
 
 		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, glm52.PredictEndpoint, bytes.NewReader(body))
 		if err != nil {
@@ -265,6 +252,8 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(io.LimitReader(upResp.Body, 4<<10))
 		_ = upResp.Body.Close()
 		upResp = nil
+		release()
+		release = nil
 
 		if isInvalidCaptchaToken(raw) && attempt < maxAttempts {
 			log.Printf("upstream captcha invalid (attempt %d/%d); fetching a fresh token", attempt, maxAttempts)
@@ -299,6 +288,39 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	if err := coalesceSSE(w, upResp.Body, s.coalesce); err != nil && r.Context().Err() == nil {
 		log.Printf("stream copy: %v", err)
+	}
+}
+
+// acquireInflight reserves one upstream concurrency slot. release must be called
+// exactly once when the upstream request/stream finishes (or immediately on
+// error before Do). Returns a no-op release when unlimited.
+func (s *server) acquireInflight(ctx context.Context) (release func(), err error) {
+	if s.inflight == nil {
+		return func() {}, nil
+	}
+	release = func() { <-s.inflight }
+
+	// Wait up to inflightWait for a slot instead of rejecting immediately;
+	// an SSE burst that would otherwise 503 can usually drain within a few
+	// hundred ms as in-flight streams finish. 0 keeps the old hard-reject.
+	if s.inflightWait <= 0 {
+		select {
+		case s.inflight <- struct{}{}:
+			return release, nil
+		default:
+			return nil, fmt.Errorf("max in-flight upstream streams reached; retry later")
+		}
+	}
+
+	timer := time.NewTimer(s.inflightWait)
+	defer timer.Stop()
+	select {
+	case s.inflight <- struct{}{}:
+		return release, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("max in-flight upstream streams reached; retry later")
+	case <-ctx.Done():
+		return nil, fmt.Errorf("client cancelled before a stream slot opened")
 	}
 }
 
@@ -373,13 +395,14 @@ func (s *server) resolveCaptcha(ctx context.Context, clientToken string, allowFl
 
 // normalizeRequestBody applies Playground-compatible defaults:
 // - stream: force continuous_usage_stats=false (usage once at end)
-// - thinking: inject chat_template_kwargs when omitted
+// - thinking: inject chat_template_kwargs when omitted, null, or empty
 func normalizeRequestBody(body []byte) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
-	if _, ok := raw["chat_template_kwargs"]; !ok {
+	kw, _ := raw["chat_template_kwargs"].(map[string]any)
+	if len(kw) == 0 {
 		raw["chat_template_kwargs"] = map[string]any{
 			"enable_thinking": true,
 			"clear_thinking":  false,

@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -125,6 +127,60 @@ func TestCoalesceSSEPassthroughWhenOff(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "Z") {
 		t.Fatalf("passthrough body=%q", rec.Body.String())
+	}
+}
+
+// failAfterNWriter fails writes after n successful Write calls so coalesceSSE
+// returns early while the upstream reader may still be producing lines.
+type failAfterNWriter struct {
+	http.ResponseWriter
+	n, writes int
+}
+
+func (w *failAfterNWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes > w.n {
+		return 0, errWriteFailed
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *failAfterNWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+var errWriteFailed = errors.New("write failed")
+
+func TestCoalesceSSEEarlyWriteErrorDoesNotHang(t *testing.T) {
+	var lines []string
+	for i := 0; i < 64; i++ {
+		lines = append(lines,
+			`data: {"id":"1","choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}`,
+			``,
+		)
+	}
+	upstream := strings.Join(lines, "\n")
+
+	rec := httptest.NewRecorder()
+	w := &failAfterNWriter{ResponseWriter: rec, n: 1}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- coalesceSSE(w, strings.NewReader(upstream), 50*time.Millisecond)
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected write error")
+		}
+		if !errors.Is(err, errWriteFailed) {
+			t.Fatalf("err=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("coalesceSSE hung after write error (reader goroutine leak?)")
 	}
 }
 

@@ -94,3 +94,15 @@ func TestApplyDefaultsPreservesCallerKwargs(t *testing.T) {
 		t.Fatalf("got %#v", req.ChatTemplateKwargs)
 	}
 }
+
+func TestApplyDefaultsFillsEmptyKwargs(t *testing.T) {
+	client := New(WithCaptchaToken("t"))
+	req := &ChatRequest{
+		Messages:           []Message{{Role: RoleUser, Content: "Hi"}},
+		ChatTemplateKwargs: map[string]any{},
+	}
+	client.applyDefaults(req)
+	if req.ChatTemplateKwargs["enable_thinking"] != true {
+		t.Fatalf("empty kwargs should get defaults, got %#v", req.ChatTemplateKwargs)
+	}
+}

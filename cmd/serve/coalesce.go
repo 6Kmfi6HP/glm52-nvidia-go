@@ -32,15 +32,25 @@ func coalesceSSE(w http.ResponseWriter, src io.Reader, window time.Duration) err
 		err  error
 	}
 	ch := make(chan readResult, 16)
+	done := make(chan struct{})
+	defer close(done)
+
 	go func() {
 		reader := bufio.NewReaderSize(src, 64<<10)
 		for {
 			line, err := reader.ReadString('\n')
 			if len(line) > 0 {
-				ch <- readResult{line: strings.TrimRight(line, "\r\n")}
+				select {
+				case ch <- readResult{line: strings.TrimRight(line, "\r\n")}:
+				case <-done:
+					return
+				}
 			}
 			if err != nil {
-				ch <- readResult{err: err}
+				select {
+				case ch <- readResult{err: err}:
+				case <-done:
+				}
 				return
 			}
 		}
@@ -59,6 +69,7 @@ func coalesceSSE(w http.ResponseWriter, src io.Reader, window time.Duration) err
 			timerC = nil
 		}
 	}
+	defer stopTimer()
 	flushPending := func() error {
 		stopTimer()
 		if pending == nil {

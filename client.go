@@ -121,7 +121,7 @@ func (c *Client) applyDefaults(r *ChatRequest) {
 	if r.TopP == 0 {
 		r.TopP = c.topP
 	}
-	if r.ChatTemplateKwargs == nil {
+	if len(r.ChatTemplateKwargs) == 0 {
 		enable := true
 		if c.thinking != nil {
 			enable = *c.thinking
