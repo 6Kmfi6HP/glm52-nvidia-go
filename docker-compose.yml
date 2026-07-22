@@ -10,3 +10,5 @@ services:
     shm_size: "2gb"
     restart: unless-stopped
     command: ["-auto", "-addr", ":8080"]
+    environment:
+      CHROME_PROXY: ${CHROME_PROXY:-}

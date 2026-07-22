@@ -29,6 +29,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -47,21 +48,36 @@ func main() {
 	captchaFlag := flag.String("captcha", "", "one-shot hCaptcha token (consumed on first use)")
 	auto := flag.Bool("auto", false, "prewarm captcha tokens via shared Chrome + pool")
 	poolSize := flag.Int("pool-size", 3, "ready captcha tokens to keep buffered (-auto)")
-	poolWorkers := flag.Int("pool-workers", 2, "concurrent captcha extractors (-auto)")
+	poolWorkers := flag.Int("pool-workers", 1, "concurrent captcha extractors / Chrome processes (-auto); each worker owns one Chrome")
 	maxInflight := flag.Int("max-inflight", 4, "max concurrent upstream streams (0=unlimited)")
 	inflightWait := flag.Duration("inflight-wait", 500*time.Millisecond, "how long to wait for an in-flight slot before returning 503 (0=reject immediately)")
 	coalesceMs := flag.Int("coalesce-ms", 16, "merge consecutive SSE content deltas within this window (0=off); first token always flushes immediately")
 	warmTimeout := flag.Duration("warm-timeout", 3*time.Minute, "wait for at least one pooled captcha before serving (-auto); 0=skip")
 	poolTTL := flag.Duration("pool-ttl", 90*time.Second, "discard pooled captcha tokens older than this (-auto)")
 	captchaWait := flag.Duration("captcha-wait", 30*time.Second, "max wait for a pooled captcha token per request (0=block until ready); then 503")
+	chromeProxy := flag.String("chrome-proxy", "", "proxy for captcha Chrome and upstream API (e.g. socks5://host:port); falls back to CHROME_PROXY")
 	flag.Parse()
 
 	if !*auto && *captchaFlag == "" {
 		log.Print("warning: no -auto/-captcha; each request must send nv-captcha-token")
 	}
 
+	proxyURL := strings.TrimSpace(*chromeProxy)
+	if proxyURL == "" {
+		proxyURL = strings.TrimSpace(os.Getenv("CHROME_PROXY"))
+	}
+	proxyFunc := http.ProxyFromEnvironment
+	if proxyURL != "" {
+		u, err := url.Parse(proxyURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			log.Fatalf("chrome-proxy: invalid URL %q", proxyURL)
+		}
+		proxyFunc = http.ProxyURL(u)
+		log.Printf("upstream + captcha proxy=%s", proxyURL)
+	}
+
 	transport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: proxyFunc,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -94,7 +110,9 @@ func main() {
 	if *auto {
 		// One Chrome process per pool worker — same-Chrome tabs never mount a
 		// second hCaptcha widget on this playground.
-		browser, err := captcha.NewBrowserGroup(ctx, *poolWorkers)
+		browser, err := captcha.NewBrowserGroup(ctx, *poolWorkers, captcha.BrowserConfig{
+			Proxy: proxyURL,
+		})
 		if err != nil {
 			log.Fatalf("captcha browser: %v", err)
 		}

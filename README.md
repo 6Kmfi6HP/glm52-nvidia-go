@@ -145,11 +145,14 @@ client := glm52.New(glm52.WithCaptchaToken(token))
 上游 predict API 本身就是 Chat Completions 格式，`serve` 只做 captcha 头适配与透传。**每个 captcha token 只能用于一次上游请求。**
 
 ```bash
-# 共享 Chrome + captcha 预热池（启动默认：pool=3 workers=2 coalesce=16ms，先预热再接流量）
+# 共享 Chrome + captcha 预热池（启动默认：pool=3 workers=1 coalesce=16ms，先预热再接流量）
 go run ./cmd/serve -auto -addr :8080
 
+# captcha Chrome + 上游 API 走同一 SOCKS5（也可设环境变量 CHROME_PROXY）
+go run ./cmd/serve -auto -chrome-proxy socks5://100.74.21.88:7890
+
 # 覆盖默认（实验脚本 scripts/ttft_sweep.sh）
-go run ./cmd/serve -auto -pool-size=2 -pool-workers=1 -coalesce-ms=0 -max-inflight=8
+go run ./cmd/serve -auto -pool-size=2 -pool-workers=2 -coalesce-ms=0 -max-inflight=8
 
 # 跳过启动预热（不推荐：首请求 TTFT 会含整段 captcha 提取）
 go run ./cmd/serve -auto -warm-timeout=0
@@ -191,7 +194,7 @@ docker run --rm -p 8080:8080 --shm-size=2g \
   ghcr.io/6kmfi6hp/glm52-nvidia-go:latest
 ```
 
-健康检查：`GET /healthz`。反向代理流式接口时请关闭 buffering，并拉长 read timeout。
+健康检查：`GET /healthz`。反向代理流式接口时请关闭 buffering，并拉长 read timeout（建议 ≥120s；空 captcha 池时 serve 最多等 `-captcha-wait`，默认 30s 后返回 503，过短的代理超时会表现为客户端 504）。
 
 环境变量：
 
@@ -199,6 +202,8 @@ docker run --rm -p 8080:8080 --shm-size=2g \
 |------|------|
 | `CHROME_PATH` | Chromium 可执行文件路径（镜像内默认 `/usr/bin/chromium`） |
 | `CHROMEDP_NO_SANDBOX` | 设为 `1` 时启用 `--no-sandbox` / `--disable-dev-shm-usage`（镜像默认开启） |
+| `CHROME_PROXY` | captcha Chrome 与上游 API 共用代理，如 `socks5://host:port`（等同 `-chrome-proxy`） |
+| `CHROME_PROXY_REMOTE_DNS` | 设为 `1` 时强制 DNS 也走 SOCKS（部分代理不支持，默认关闭） |
 
 ## 发版与镜像
 
