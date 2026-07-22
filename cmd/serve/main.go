@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -52,6 +53,7 @@ func main() {
 	coalesceMs := flag.Int("coalesce-ms", 16, "merge consecutive SSE content deltas within this window (0=off); first token always flushes immediately")
 	warmTimeout := flag.Duration("warm-timeout", 3*time.Minute, "wait for at least one pooled captcha before serving (-auto); 0=skip")
 	poolTTL := flag.Duration("pool-ttl", 90*time.Second, "discard pooled captcha tokens older than this (-auto)")
+	captchaWait := flag.Duration("captcha-wait", 30*time.Second, "max wait for a pooled captcha token per request (0=block until ready); then 503")
 	flag.Parse()
 
 	if !*auto && *captchaFlag == "" {
@@ -82,6 +84,7 @@ func main() {
 		flagCaptcha:  *captchaFlag,
 		coalesce:     time.Duration(*coalesceMs) * time.Millisecond,
 		inflightWait: *inflightWait,
+		captchaWait:  *captchaWait,
 		httpClient:   &http.Client{Timeout: 0, Transport: transport},
 	}
 	if *maxInflight > 0 {
@@ -89,7 +92,9 @@ func main() {
 	}
 
 	if *auto {
-		browser, err := captcha.NewBrowser(ctx)
+		// One Chrome process per pool worker — same-Chrome tabs never mount a
+		// second hCaptcha widget on this playground.
+		browser, err := captcha.NewBrowserGroup(ctx, *poolWorkers)
 		if err != nil {
 			log.Fatalf("captcha browser: %v", err)
 		}
@@ -103,7 +108,8 @@ func main() {
 			s.pool.Close()
 			s.browser.Close()
 		}()
-		log.Printf("captcha pool: size=%d workers=%d ttl=%s", *poolSize, *poolWorkers, *poolTTL)
+		log.Printf("captcha pool: size=%d workers=%d chromes=%d ttl=%s captcha-wait=%s",
+			*poolSize, *poolWorkers, browser.Len(), *poolTTL, *captchaWait)
 
 		if *warmTimeout > 0 {
 			log.Printf("warming captcha pool (timeout=%s)…", *warmTimeout)
@@ -140,8 +146,9 @@ type server struct {
 	httpClient   *http.Client
 	inflight     chan struct{} // nil = unlimited
 	inflightWait time.Duration // how long to wait for a slot before 503 (0=reject now)
+	captchaWait  time.Duration // max wait for pool Take (0=unlimited)
 
-	browser *captcha.Browser
+	browser *captcha.BrowserGroup
 	pool    *captcha.Pool
 
 	mu          sync.Mutex
@@ -215,16 +222,29 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	var upResp *http.Response
+	reqStart := time.Now()
+	var (
+		upResp       *http.Response
+		captchaWait  time.Duration
+		inflightWait time.Duration
+		upstreamTTFB time.Duration
+	)
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		t0 := time.Now()
 		token, err := s.resolveCaptcha(r.Context(), clientToken, attempt == 1)
+		captchaWait += time.Since(t0)
 		if err != nil {
-			httpError(w, http.StatusUnauthorized, err.Error())
+			log.Printf("timing captcha=%s ready=%d err=%v", captchaWait.Round(time.Millisecond), s.poolReady(), err)
+			httpError(w, captchaResolveStatus(err), err.Error())
 			return
 		}
 
+		t1 := time.Now()
 		rel, err := s.acquireInflight(r.Context())
+		inflightWait += time.Since(t1)
 		if err != nil {
+			log.Printf("timing captcha=%s inflight=%s ready=%d err=%v",
+				captchaWait.Round(time.Millisecond), inflightWait.Round(time.Millisecond), s.poolReady(), err)
 			httpError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		}
@@ -242,8 +262,13 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		upReq.Header.Set("Origin", "https://build.nvidia.com")
 		upReq.Header.Set("Referer", "https://build.nvidia.com/")
 
+		t2 := time.Now()
 		upResp, err = s.httpClient.Do(upReq)
+		upstreamTTFB = time.Since(t2)
 		if err != nil {
+			log.Printf("timing captcha=%s inflight=%s upstream_ttfb=%s ready=%d err=%v",
+				captchaWait.Round(time.Millisecond), inflightWait.Round(time.Millisecond),
+				upstreamTTFB.Round(time.Millisecond), s.poolReady(), err)
 			httpError(w, http.StatusBadGateway, fmt.Sprintf("upstream: %v", err))
 			return
 		}
@@ -253,17 +278,22 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		raw, _ := io.ReadAll(io.LimitReader(upResp.Body, 4<<10))
+		status := upResp.StatusCode
 		_ = upResp.Body.Close()
 		upResp = nil
 		release()
 		release = nil
 
 		if isInvalidCaptchaToken(raw) && attempt < maxAttempts {
-			log.Printf("upstream captcha invalid (attempt %d/%d); fetching a fresh token", attempt, maxAttempts)
+			log.Printf("upstream captcha invalid (attempt %d/%d); fetching a fresh token (captcha=%s upstream_ttfb=%s)",
+				attempt, maxAttempts, captchaWait.Round(time.Millisecond), upstreamTTFB.Round(time.Millisecond))
 			continue
 		}
 
 		if isInvalidCaptchaToken(raw) {
+			log.Printf("timing captcha=%s inflight=%s upstream_ttfb=%s status=401 ready=%d captcha_invalid",
+				captchaWait.Round(time.Millisecond), inflightWait.Round(time.Millisecond),
+				upstreamTTFB.Round(time.Millisecond), s.poolReady())
 			httpError(w, http.StatusUnauthorized, "captcha token invalid or expired; retry the request")
 			return
 		}
@@ -271,6 +301,9 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if msg == "" {
 			msg = "upstream request failed"
 		}
+		log.Printf("timing captcha=%s inflight=%s upstream_ttfb=%s status=%d ready=%d err=%s",
+			captchaWait.Round(time.Millisecond), inflightWait.Round(time.Millisecond),
+			upstreamTTFB.Round(time.Millisecond), status, s.poolReady(), truncateLog(msg, 120))
 		httpError(w, http.StatusBadGateway, msg)
 		return
 	}
@@ -289,9 +322,63 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(upResp.StatusCode)
 
-	if err := coalesceSSE(w, upResp.Body, s.coalesce); err != nil && r.Context().Err() == nil {
-		log.Printf("stream copy: %v", err)
+	tw := &firstByteWriter{ResponseWriter: w, start: time.Now()}
+	streamErr := coalesceSSE(tw, upResp.Body, s.coalesce)
+	streamDur := time.Since(tw.start)
+	ttftClient := tw.firstByte
+	if !tw.sawWrite {
+		ttftClient = streamDur
 	}
+	log.Printf("timing captcha=%s inflight=%s upstream_ttfb=%s client_ttft=%s stream=%s total=%s status=%d ready=%d",
+		captchaWait.Round(time.Millisecond),
+		inflightWait.Round(time.Millisecond),
+		upstreamTTFB.Round(time.Millisecond),
+		ttftClient.Round(time.Millisecond),
+		streamDur.Round(time.Millisecond),
+		time.Since(reqStart).Round(time.Millisecond),
+		upResp.StatusCode,
+		s.poolReady(),
+	)
+	if streamErr != nil && r.Context().Err() == nil {
+		log.Printf("stream copy: %v", streamErr)
+	}
+}
+
+func (s *server) poolReady() int {
+	if s.pool == nil {
+		return -1
+	}
+	return s.pool.Ready()
+}
+
+// firstByteWriter records time-to-first-write (client TTFT after headers).
+type firstByteWriter struct {
+	http.ResponseWriter
+	start     time.Time
+	firstByte time.Duration
+	sawWrite  bool
+}
+
+func (w *firstByteWriter) Write(p []byte) (int, error) {
+	if !w.sawWrite && len(p) > 0 {
+		w.firstByte = time.Since(w.start)
+		w.sawWrite = true
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *firstByteWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func truncateLog(s string, n int) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // acquireInflight reserves one upstream concurrency slot. release must be called
@@ -388,12 +475,47 @@ func (s *server) resolveCaptcha(ctx context.Context, clientToken string, allowFl
 	}
 
 	if s.pool != nil {
-		return s.pool.Take(ctx)
+		takeCtx := ctx
+		var cancel context.CancelFunc
+		if s.captchaWait > 0 {
+			takeCtx, cancel = context.WithTimeout(ctx, s.captchaWait)
+			defer cancel()
+		}
+		if s.pool.Ready() == 0 {
+			waitFor := "indefinitely"
+			if s.captchaWait > 0 {
+				waitFor = s.captchaWait.String()
+			}
+			log.Printf("captcha pool empty; waiting up to %s (errors will surface from workers)", waitFor)
+		}
+		tok, err := s.pool.Take(takeCtx)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				fills, takes, errs, expired := s.pool.Stats()
+				return "", fmt.Errorf("captcha pool empty after %s (ready=%d fills=%d takes=%d errors=%d expired=%d); retry later",
+					s.captchaWait, s.pool.Ready(), fills, takes, errs, expired)
+			}
+			return "", err
+		}
+		return tok, nil
 	}
 	if s.auto {
 		return captcha.Extract(ctx)
 	}
 	return "", fmt.Errorf("captcha token required: send nv-captcha-token, or restart with -captcha / -auto")
+}
+
+func captchaResolveStatus(err error) int {
+	if err == nil {
+		return http.StatusOK
+	}
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "captcha pool empty after") {
+		return http.StatusServiceUnavailable
+	}
+	if errors.Is(err, context.Canceled) {
+		return http.StatusRequestTimeout
+	}
+	return http.StatusUnauthorized
 }
 
 // normalizeRequestBody applies Playground-compatible defaults:

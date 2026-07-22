@@ -32,6 +32,10 @@ type entry struct {
 // Pool pre-warms one-shot captcha tokens on a bounded channel so request
 // handlers can Take without waiting on a full browser navigate.
 // Tokens older than TTL are discarded on Take (hCaptcha tokens expire ~2–3 min).
+//
+// A background reaper discards stale buffered tokens during idle so workers are
+// not stuck blocked on a full channel of expired entries (the "chat, then wait,
+// then request hangs" failure mode).
 type Pool struct {
 	extract ExtractFunc
 	tokens  chan entry
@@ -78,6 +82,8 @@ func NewPool(parent context.Context, extract ExtractFunc, cfg PoolConfig) *Pool 
 		p.wg.Add(1)
 		go p.worker(i)
 	}
+	p.wg.Add(1)
+	go p.reaper()
 	return p
 }
 
@@ -99,9 +105,10 @@ func (p *Pool) worker(id int) {
 				return
 			}
 			// Exponential backoff with jitter — a sustained captcha outage
-			// must not busy-loop (fixed 2s did) nor drown the logs. Reset on
-			// success below.
-			if consecFailures%logEveryNth == 0 {
+			// must not busy-loop (fixed 2s did) nor drown the logs. Log the
+			// first failure immediately (pool-empty hangs are otherwise silent),
+			// then every Nth. Reset on success below.
+			if consecFailures == 1 || consecFailures%logEveryNth == 0 {
 				log.Printf("captcha pool worker %d: %v (consecutive failures=%d, backing off)",
 					id, err, consecFailures)
 			}
@@ -120,6 +127,68 @@ func (p *Pool) worker(id int) {
 			p.fills.Add(1)
 		case <-p.ctx.Done():
 			return
+		}
+	}
+}
+
+// reaper keeps the buffer usable while idle: channel is FIFO, so expired tokens
+// sit at the front and block workers from inserting replacements until drained.
+// Only hard-TTL entries are dropped (not an early refreshAge) — premature
+// discard caused continuous mint→reap churn and log spam during long streams.
+func (p *Pool) reaper() {
+	defer p.wg.Done()
+	interval := p.ttl / 4
+	if interval > 30*time.Second {
+		interval = 30 * time.Second
+	}
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	var lastLog time.Time
+	for {
+		select {
+		case <-p.ctx.Done():
+			return
+		case <-t.C:
+			n := p.discardStale()
+			if n == 0 {
+				continue
+			}
+			// Rate-limit: idle pools otherwise log every tick while workers refill.
+			if time.Since(lastLog) < time.Minute && p.Ready() > 0 {
+				continue
+			}
+			lastLog = time.Now()
+			log.Printf("captcha pool: reaped %d stale token(s); ready=%d (workers refill)", n, p.Ready())
+		}
+	}
+}
+
+func (p *Pool) discardStale() int {
+	var keep []entry
+	n := 0
+	for {
+		select {
+		case e := <-p.tokens:
+			if time.Since(e.at) > p.ttl {
+				p.expired.Add(1)
+				n++
+			} else {
+				keep = append(keep, e)
+			}
+		default:
+			for _, e := range keep {
+				select {
+				case p.tokens <- e:
+				case <-p.ctx.Done():
+					return n
+				default:
+					// Worker refilled while we held e; buffer is full of newer tokens.
+				}
+			}
+			return n
 		}
 	}
 }

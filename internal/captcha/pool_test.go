@@ -106,3 +106,40 @@ func TestPoolClosed(t *testing.T) {
 		t.Fatal("expected error after Close")
 	}
 }
+
+// Idle: channel fills, tokens age past TTL, reaper drains them so workers
+// can refill — without a Take. This is the "chat then wait" failure mode.
+func TestPoolReapsStaleDuringIdle(t *testing.T) {
+	var n atomic.Int32
+	extract := func(ctx context.Context) (string, error) {
+		return fmt.Sprintf("tok-%d", n.Add(1)), nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := NewPool(ctx, extract, PoolConfig{Size: 2, Workers: 1, TTL: 200 * time.Millisecond})
+	defer p.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for p.Ready() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if p.Ready() < 2 {
+		t.Fatal("pool never filled")
+	}
+	fillsBefore, _, _, _ := p.Stats()
+
+	// Past hard TTL and several reaper ticks (ttl/4, min 100ms).
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		fills, _, _, expired := p.Stats()
+		if expired >= 1 && fills > fillsBefore {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	fillsAfter, _, _, expired := p.Stats()
+	t.Fatalf("idle reap did not refresh: fills %d→%d expired=%d ready=%d",
+		fillsBefore, fillsAfter, expired, p.Ready())
+}

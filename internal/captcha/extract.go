@@ -64,7 +64,8 @@ func navigateAndExecute(ctx context.Context) (string, error) {
 }
 
 // executeOnly assumes the sticky tab is already on the playground with hCaptcha ready.
-// Uses reset+execute so each call mints a fresh one-shot token (cmd/captchaopt: sticky_reset).
+// Mirrors NVIDIA Playground: execute({async:true}) then read response (no reset).
+// chromedp cannot await that Promise, so we fire execute and poll the attribute.
 func executeOnly(ctx context.Context) (string, error) {
 	var prev, token string
 	if err := chromedp.Run(ctx, chromedp.Evaluate(`(() => {
@@ -88,19 +89,25 @@ func executeOnly(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("empty captcha token — headless Chrome may be blocked; supply nv-captcha-token instead")
 	}
 	if token == prev {
-		return "", fmt.Errorf("captcha token did not refresh after reset+execute")
+		return "", fmt.Errorf("captcha token did not refresh after execute({async:true})")
 	}
 	return token, nil
 }
 
+// execJS matches NVIDIA Playground: hcaptcha.execute(id, {async:true}).
+// Must stay synchronous for chromedp.Evaluate — awaiting an async IIFE here
+// resolves to {} (CDP/chromedp awaitPromise mishandles the nested thenable).
+// Go pollTokenUntilChange waits for data-hcaptcha-response / getResponse.
 func execJS() string {
 	return `(() => {
 		const el = document.querySelector('[data-hcaptcha-widget-id]');
 		if (!el || typeof hcaptcha === 'undefined') return '';
 		const id = el.getAttribute('data-hcaptcha-widget-id');
-		el.setAttribute('data-hcaptcha-response', '');
-		try { hcaptcha.reset(id); } catch (e) {}
-		try { hcaptcha.execute(id); } catch (e) {}
+		try { hcaptcha.execute(id, { async: true }); } catch (e) {}
+		try {
+			const t = typeof hcaptcha.getResponse === 'function' ? hcaptcha.getResponse(id) : '';
+			if (typeof t === 'string' && t) return t;
+		} catch (e) {}
 		return el.getAttribute('data-hcaptcha-response') || '';
 	})()`
 }

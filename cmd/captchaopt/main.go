@@ -286,7 +286,13 @@ func newSession(parent context.Context, v variant) (*session, error) {
 	}
 
 	allocCtx, cancel := chromedp.NewExecAllocator(parent, opts...)
-	browser, bCancel := chromedp.NewContext(allocCtx)
+	browser, bCancel := chromedp.NewContext(allocCtx, chromedp.WithErrorf(func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		if strings.HasPrefix(msg, "unhandled node event") || strings.HasPrefix(msg, "unhandled page event") {
+			return
+		}
+		log.Printf("ERROR: "+format, args...)
+	}))
 	// Allocate Chrome on browserCtx itself (do NOT wrap first Run in a
 	// canceling timeout — that kills the process via exec.CommandContext).
 	if err := chromedp.Run(browser, chromedp.Navigate("about:blank")); err != nil {
@@ -427,19 +433,32 @@ func executeOnly(ctx context.Context, withReset bool) (string, error) {
 }
 
 func execJS(withReset bool) string {
-	reset := ""
-	if withReset {
-		reset = `try { hcaptcha.reset(id); } catch (e) {}`
+	// Production path (internal/captcha) uses execute({async:true}) only.
+	// sticky_reset still exercises reset+sync execute for A/B; sticky_exec
+	// matches the Playground hook (async execute + getResponse).
+	if !withReset {
+		// Align with production: sync fire execute({async:true}); chromedp cannot await.
+		return `(() => {
+			const el = document.querySelector('[data-hcaptcha-widget-id]');
+			if (!el || typeof hcaptcha === 'undefined') return '';
+			const id = el.getAttribute('data-hcaptcha-widget-id');
+			try { hcaptcha.execute(id, { async: true }); } catch (e) {}
+			try {
+				const t = typeof hcaptcha.getResponse === 'function' ? hcaptcha.getResponse(id) : '';
+				if (typeof t === 'string' && t) return t;
+			} catch (e) {}
+			return el.getAttribute('data-hcaptcha-response') || '';
+		})()`
 	}
-	return fmt.Sprintf(`(() => {
+	return `(() => {
 		const el = document.querySelector('[data-hcaptcha-widget-id]');
 		if (!el || typeof hcaptcha === 'undefined') return '';
 		const id = el.getAttribute('data-hcaptcha-widget-id');
 		el.setAttribute('data-hcaptcha-response', '');
-		%s
+		try { hcaptcha.reset(id); } catch (e) {}
 		try { hcaptcha.execute(id); } catch (e) {}
 		return el.getAttribute('data-hcaptcha-response') || '';
-	})()`, reset)
+	})()`
 }
 
 func waitHCaptchaReady() chromedp.Action {
