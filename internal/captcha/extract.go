@@ -14,7 +14,7 @@ const playgroundURL = "https://build.nvidia.com/z-ai/glm-5.2/playground"
 // Extract is a one-shot helper: start Chrome, scrape one token, shut down.
 // Prefer Browser + Pool for concurrent serving.
 func Extract(baseCtx context.Context) (string, error) {
-	b, err := NewBrowser(baseCtx)
+	b, err := NewBrowser(baseCtx, BrowserConfig{})
 	if err != nil {
 		return "", err
 	}
@@ -135,19 +135,20 @@ func pollTokenUntilChange(ctx context.Context, prev string) (string, error) {
 	var token string
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		if err := chromedp.Run(ctx,
-			chromedp.Sleep(150*time.Millisecond),
-			chromedp.Evaluate(`(() => {
-				const el = document.querySelector('[data-hcaptcha-widget-id]');
-				return el ? (el.getAttribute('data-hcaptcha-response') || '') : '';
-			})()`, &token),
-		); err != nil {
+		// Read first: executeOnly may have completed between its initial
+		// Evaluate and this call, so a fixed pre-read sleep adds pure latency.
+		if err := chromedp.Run(ctx, chromedp.Evaluate(`(() => {
+			const el = document.querySelector('[data-hcaptcha-widget-id]');
+			return el ? (el.getAttribute('data-hcaptcha-response') || '') : '';
+		})()`, &token)); err != nil {
 			return "", fmt.Errorf("chromedp poll: %w", err)
 		}
 		if token != "" && token != prev {
 			return token, nil
 		}
-		_ = chromedp.Run(ctx, chromedp.Evaluate(execJS(), nil))
+		if err := chromedp.Sleep(50 * time.Millisecond).Do(ctx); err != nil {
+			return "", fmt.Errorf("chromedp poll: %w", err)
+		}
 	}
 	return token, nil
 }

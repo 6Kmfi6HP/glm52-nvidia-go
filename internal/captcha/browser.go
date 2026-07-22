@@ -43,32 +43,17 @@ const stickyMaxIdle = 60 * time.Second
 // NewBrowser starts a shared Chrome process and warms the playground page.
 // Call Close when done.
 //
-// Container hints:
+// Container / proxy hints:
 //   - CHROME_PATH: absolute path to chromium/chrome binary
 //   - CHROMEDP_NO_SANDBOX=1: add --no-sandbox and --disable-dev-shm-usage
 //   - CHROMEDP_ALLOW_IMAGES=1: re-enable image loading (default is off). Pictures
 //     are unnecessary for this invisible hCaptcha widget, so images are blocked
 //     by default to cut per-navigate RAM/bandwidth; re-enable only if a future
 //     site change makes image decode required for token extraction.
-func NewBrowser(parent context.Context) (*Browser, error) {
-	allocOpts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("enable-automation", false),
-		chromedp.Flag("no-first-run", true),
-		chromedp.Flag("no-default-browser-check", true),
-		// Resource-saving flags that do not affect hCaptcha token extraction:
-		// the tab only needs JS to fire hcaptcha.execute() and read one attribute.
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("disable-extensions", true),
-		chromedp.Flag("disable-background-networking", true),
-		chromedp.Flag("disable-default-apps", true),
-		chromedp.Flag("disable-sync", true),
-		chromedp.Flag("disable-translate", true),
-		chromedp.Flag("disable-component-extensions-with-background-pages", true),
-		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-		chromedp.WindowSize(1280, 900),
-	)
+//   - CHROME_PROXY / BrowserConfig.Proxy: Chrome --proxy-server (e.g. socks5://host:port)
+func NewBrowser(parent context.Context, cfg BrowserConfig) (*Browser, error) {
+	cfg = cfg.withDefaults()
+	allocOpts := ChromeAllocatorOptions()
 	if path := os.Getenv("CHROME_PATH"); path != "" {
 		allocOpts = append(allocOpts, chromedp.ExecPath(path))
 	}
@@ -85,6 +70,9 @@ func NewBrowser(parent context.Context) (*Browser, error) {
 		allocOpts = append(allocOpts,
 			chromedp.Flag("blink-settings", "imagesEnabled=false"),
 		)
+	}
+	if cfg.Proxy != "" {
+		allocOpts = append(allocOpts, chromeProxyOpts(cfg.Proxy)...)
 	}
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(parent, allocOpts...)
@@ -129,7 +117,8 @@ func (b *Browser) Extract(ctx context.Context) (string, error) {
 
 	// Sticky execute is normally ~300ms; bound it tightly so a hung widget
 	// fails fast and re-navigate can start (pool Take otherwise waits with
-	// no tokens).
+	// no tokens). 5s is enough for a healthy sticky path and avoids burning
+	// most of captcha-wait (30s) before recovery begins.
 	needNav := !b.warmed || time.Since(b.lastOK) > stickyMaxIdle
 	if needNav {
 		token, err := b.runExtract(ctx, 90*time.Second, navigateAndExecute)
@@ -142,7 +131,7 @@ func (b *Browser) Extract(ctx context.Context) (string, error) {
 		return token, nil
 	}
 
-	token, err := b.runExtract(ctx, 15*time.Second, executeOnly)
+	token, err := b.runExtract(ctx, 5*time.Second, executeOnly)
 	if err == nil {
 		b.lastOK = time.Now()
 		return token, nil

@@ -21,6 +21,7 @@ import (
 	"github.com/chromedp/chromedp"
 
 	glm52 "glm52-nvidia"
+	"glm52-nvidia/internal/captcha"
 )
 
 const playgroundURL = "https://build.nvidia.com/z-ai/glm-5.2/playground"
@@ -246,22 +247,7 @@ type session struct {
 }
 
 func newSession(parent context.Context, v variant) (*session, error) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
-		chromedp.Flag("disable-blink-features", "AutomationControlled"),
-		chromedp.Flag("enable-automation", false),
-		chromedp.Flag("no-first-run", true),
-		chromedp.Flag("no-default-browser-check", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("disable-extensions", true),
-		chromedp.Flag("disable-background-networking", true),
-		chromedp.Flag("disable-default-apps", true),
-		chromedp.Flag("disable-sync", true),
-		chromedp.Flag("disable-translate", true),
-		chromedp.Flag("disable-component-extensions-with-background-pages", true),
-		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-		chromedp.WindowSize(1280, 900),
-	)
+	opts := captcha.ChromeAllocatorOptions()
 	if path := os.Getenv("CHROME_PATH"); path != "" {
 		opts = append(opts, chromedp.ExecPath(path))
 	}
