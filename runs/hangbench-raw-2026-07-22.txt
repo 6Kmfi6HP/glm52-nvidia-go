@@ -1,0 +1,88 @@
+hangbench: idle=1m5s workers=[1 2] drain=4 take-wait=30s pool-size=2 skip-idle=false
+host chrome/chromedp procs before: 33
+
+=== A: sticky Browser extract timing ===
+  warm+alloc: 9.3s  chrome_procs=41
+  extract#1 first_after_warm: 3.296s tok_len=1663
+  extract#2 steady: 1.633s tok_len=1670
+  extract#3 steady: 164ms tok_len=1650
+  sleeping idle=1m5s (expect sticky re-nav on next)…
+  extract#post_idle: 2.322s tok_len=1660
+
+=== B: pool workers=1 size=2 drain=4 ===
+  group warm: 3.697s chromes=1 chrome_procs=43
+  pool ready=1 (warm)
+  take#1 OK 149ms
+  take#2 OK 462ms
+  take#3 OK 774ms
+  take#4 OK 0s
+  summary wall=774ms ok=4 fail=0 max_ok=774ms ready=0 fills=4 takes=4 errors=0 expired=0 chrome_procs=45
+
+=== B: pool workers=2 size=2 drain=4 ===
+  group warm: 8.301s chromes=2 chrome_procs=52
+  pool ready=1 (warm)
+  take#1 OK 213ms
+  take#2 OK 394ms
+  take#3 OK 559ms
+  take#4 OK 0s
+  summary wall=559ms ok=4 fail=0 max_ok=559ms ready=0 fills=4 takes=4 errors=0 expired=0 chrome_procs=54
+
+host chrome/chromedp procs after: 34
+done
+package command-line-arguments
+	/tmp/hangidle/main.go:15:2: use of internal package glm52-nvidia/internal/captcha not allowed
+hangbench: idle=1m10s workers=[1 2] drain=4 take-wait=30s pool-size=2 skip-idle=false idle-burst=true
+host chrome/chromedp procs before: 33
+
+=== C: idle-burst workers=1 ===
+  warm 8.828s ready=2 chrome_procs=43
+  holding full pool; idle 1m10s (sticky ages)…
+  after idle ready=2 fills=5 takes=0 errors=0 expired=0 chrome_procs=44
+  take#1 OK 0s
+  take#2 OK 0s
+  take#3 OK 630ms
+  take#4 OK 0s
+  summary wall=631ms ok=4 fail=0 max_ok=630ms ready=0 fills=7 takes=4 errors=0 expired=0 chrome_procs=44
+
+=== C: idle-burst workers=2 ===
+  warm 9.422s ready=2 chrome_procs=55
+  holding full pool; idle 1m10s (sticky ages)…
+  after idle ready=2 fills=8 takes=0 errors=0 expired=0 chrome_procs=63
+  take#1 OK 0s
+  take#2 OK 0s
+  take#3 OK 0s
+  take#4 OK 0s
+  summary wall=1ms ok=4 fail=0 max_ok=0s ready=0 fills=10 takes=4 errors=0 expired=0 chrome_procs=59
+
+host chrome/chromedp procs after: 38
+done
+hangbench: idle=1m40s workers=[1] drain=4 take-wait=30s pool-size=2 skip-idle=false idle-burst=true
+host chrome/chromedp procs before: 35
+
+=== C: idle-burst workers=1 ===
+  warm 7.677s ready=2 chrome_procs=45
+  holding full pool; idle 1m40s (sticky ages)…
+  after idle ready=2 fills=6 takes=0 errors=0 expired=0 chrome_procs=43
+  take#1 OK 1.342s
+  take#2 OK 0s
+  take#3 OK 1.092s
+  take#4 OK 818ms
+  summary wall=1.342s ok=4 fail=0 max_ok=1.342s ready=0 fills=10 takes=4 errors=0 expired=2 chrome_procs=43
+
+host chrome/chromedp procs after: 33
+done
+hangbench: idle=1m10s workers=[1] drain=4 take-wait=30s pool-size=2 skip-idle=false idle-burst=true
+host chrome/chromedp procs before: 32
+
+=== C: idle-burst workers=1 ===
+  warm 10.869s ready=2 chrome_procs=42
+  holding full pool; idle 1m10s (sticky ages)…
+  after idle ready=2 fills=2 takes=0 errors=0 expired=0 chrome_procs=41
+  take#1 OK 0s
+  take#2 OK 2.09s
+  take#3 OK 0s
+  take#4 OK 2.24s
+  summary wall=2.24s ok=4 fail=0 max_ok=2.24s ready=0 fills=4 takes=4 errors=0 expired=0 chrome_procs=41
+
+host chrome/chromedp procs after: 32
+done
