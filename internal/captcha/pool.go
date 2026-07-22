@@ -29,17 +29,26 @@ type entry struct {
 	at    time.Time
 }
 
-// Pool pre-warms one-shot captcha tokens on a bounded channel so request
-// handlers can Take without waiting on a full browser navigate.
+// Pool pre-warms one-shot captcha tokens so request handlers can Take without
+// waiting on a full browser navigate.
 // Tokens older than TTL are discarded on Take (hCaptcha tokens expire ~2–3 min).
 //
 // A background reaper discards stale buffered tokens during idle so workers are
-// not stuck blocked on a full channel of expired entries (the "chat, then wait,
+// not stuck behind a full buffer of expired entries (the "chat, then wait,
 // then request hangs" failure mode).
+//
+// Workers wait for buffer space *before* minting. Combined with a mutex-backed
+// FIFO (not a channel drain/restore), a full fresh pool truly idles Chrome —
+// see runs/hangbench-2026-07-22.md.
 type Pool struct {
 	extract ExtractFunc
-	tokens  chan entry
+	size    int
 	ttl     time.Duration
+
+	mu       sync.Mutex
+	tokens   []entry
+	reserved int           // workers currently minting for an available slot
+	changed  chan struct{} // closed/replaced whenever queue capacity or data changes
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -73,7 +82,9 @@ func NewPool(parent context.Context, extract ExtractFunc, cfg PoolConfig) *Pool 
 	ctx, cancel := context.WithCancel(parent)
 	p := &Pool{
 		extract: extract,
-		tokens:  make(chan entry, cfg.Size),
+		size:    cfg.Size,
+		tokens:  make([]entry, 0, cfg.Size),
+		changed: make(chan struct{}),
 		ttl:     cfg.TTL,
 		ctx:     ctx,
 		cancel:  cancel,
@@ -91,14 +102,13 @@ func (p *Pool) worker(id int) {
 	defer p.wg.Done()
 	var consecFailures int
 	for {
-		select {
-		case <-p.ctx.Done():
+		if !p.reserveSlot() {
 			return
-		default:
 		}
 
 		token, err := p.extract(p.ctx)
 		if err != nil {
+			p.releaseReservation()
 			p.errors.Add(1)
 			consecFailures++
 			if p.ctx.Err() != nil {
@@ -122,19 +132,64 @@ func (p *Pool) worker(id int) {
 		}
 
 		consecFailures = 0
-		select {
-		case p.tokens <- entry{token: token, at: time.Now()}:
-			p.fills.Add(1)
-		case <-p.ctx.Done():
+		if !p.enqueue(token) {
 			return
 		}
 	}
 }
 
-// reaper keeps the buffer usable while idle: channel is FIFO, so expired tokens
-// sit at the front and block workers from inserting replacements until drained.
-// Only hard-TTL entries are dropped (not an early refreshAge) — premature
-// discard caused continuous mint→reap churn and log spam during long streams.
+// reserveSlot blocks until queue capacity is available, then claims it before
+// extraction. The reservation prevents concurrent workers from over-minting.
+func (p *Pool) reserveSlot() bool {
+	for {
+		p.mu.Lock()
+		if p.ctx.Err() != nil {
+			p.mu.Unlock()
+			return false
+		}
+		if len(p.tokens)+p.reserved < p.size {
+			p.reserved++
+			p.mu.Unlock()
+			return true
+		}
+		changed := p.changed
+		p.mu.Unlock()
+		select {
+		case <-p.ctx.Done():
+			return false
+		case <-changed:
+		}
+	}
+}
+
+func (p *Pool) releaseReservation() {
+	p.mu.Lock()
+	p.reserved--
+	p.notifyLocked()
+	p.mu.Unlock()
+}
+
+func (p *Pool) enqueue(token string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reserved--
+	if p.ctx.Err() != nil {
+		p.notifyLocked()
+		return false
+	}
+	p.tokens = append(p.tokens, entry{token: token, at: time.Now()})
+	p.fills.Add(1)
+	p.notifyLocked()
+	return true
+}
+
+// notifyLocked wakes waiters without polling. p.mu must be held.
+func (p *Pool) notifyLocked() {
+	close(p.changed)
+	p.changed = make(chan struct{})
+}
+
+// reaper drops expired FIFO-front entries during idle so workers can refill.
 func (p *Pool) reaper() {
 	defer p.wg.Done()
 	interval := p.ttl / 4
@@ -166,31 +221,21 @@ func (p *Pool) reaper() {
 	}
 }
 
+// discardStale drops only expired entries from the FIFO front without touching
+// fresh tokens (inspect under mutex — no evacuate/restore race).
 func (p *Pool) discardStale() int {
-	var keep []entry
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	n := 0
-	for {
-		select {
-		case e := <-p.tokens:
-			if time.Since(e.at) > p.ttl {
-				p.expired.Add(1)
-				n++
-			} else {
-				keep = append(keep, e)
-			}
-		default:
-			for _, e := range keep {
-				select {
-				case p.tokens <- e:
-				case <-p.ctx.Done():
-					return n
-				default:
-					// Worker refilled while we held e; buffer is full of newer tokens.
-				}
-			}
-			return n
-		}
+	for len(p.tokens) > 0 && time.Since(p.tokens[0].at) > p.ttl {
+		p.tokens = p.tokens[1:]
+		p.expired.Add(1)
+		n++
 	}
+	if n > 0 {
+		p.notifyLocked()
+	}
+	return n
 }
 
 // backoffFor computes 2^n * backoffMin capped at backoffMax, ±jitter.
@@ -219,18 +264,36 @@ func backoffFor(n int) time.Duration {
 // one is ready / ctx cancels. Expired tokens are dropped and counted.
 func (p *Pool) Take(ctx context.Context) (string, error) {
 	for {
-		select {
-		case e := <-p.tokens:
+		p.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			p.mu.Unlock()
+			return "", err
+		}
+		if p.ctx.Err() != nil {
+			p.mu.Unlock()
+			return "", fmt.Errorf("captcha pool closed")
+		}
+		if len(p.tokens) > 0 {
+			e := p.tokens[0]
+			p.tokens = p.tokens[1:]
+			p.notifyLocked()
+			p.mu.Unlock()
 			if time.Since(e.at) > p.ttl {
 				p.expired.Add(1)
 				continue
 			}
 			p.takes.Add(1)
 			return e.token, nil
+		}
+		changed := p.changed
+		p.mu.Unlock()
+
+		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-p.ctx.Done():
 			return "", fmt.Errorf("captcha pool closed")
+		case <-changed:
 		}
 	}
 }
@@ -242,6 +305,8 @@ func (p *Pool) Stats() (fills, takes, errors, expired uint64) {
 
 // Ready returns how many tokens are currently buffered (may include soon-to-expire).
 func (p *Pool) Ready() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return len(p.tokens)
 }
 
