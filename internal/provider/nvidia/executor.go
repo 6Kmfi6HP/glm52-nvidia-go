@@ -1,0 +1,503 @@
+package nvidia
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	glm52 "glm52-nvidia"
+	"glm52-nvidia/internal/captcha"
+	"glm52-nvidia/internal/models"
+
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	clipexec "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
+)
+
+const providerKey = "nvidia"
+
+// Options configures the Nvidia playground executor.
+type Options struct {
+	Auto         bool
+	FlagCaptcha  string
+	Coalesce     time.Duration
+	MaxInflight  int
+	InflightWait time.Duration
+	CaptchaWait  time.Duration
+	HTTPClient   *http.Client
+	Pool         *captcha.Pool
+
+	// PredictURL optionally overrides models.ModelInfo.PredictEndpoint (tests).
+	PredictURL func(models.ModelInfo) string
+}
+
+// Executor implements coreauth.ProviderExecutor for NVIDIA playground predict.
+type Executor struct {
+	auto         bool
+	coalesce     time.Duration
+	httpClient   *http.Client
+	inflight     chan struct{}
+	inflightWait time.Duration
+	captchaWait  time.Duration
+	pool         *captcha.Pool
+	predictURL   func(models.ModelInfo) string
+
+	mu          sync.Mutex
+	flagCaptcha string
+}
+
+// NewExecutor builds an Executor from Options.
+func NewExecutor(opts Options) *Executor {
+	e := &Executor{
+		auto:         opts.Auto,
+		coalesce:     opts.Coalesce,
+		httpClient:   opts.HTTPClient,
+		inflightWait: opts.InflightWait,
+		captchaWait:  opts.CaptchaWait,
+		pool:         opts.Pool,
+		predictURL:   opts.PredictURL,
+		flagCaptcha:  opts.FlagCaptcha,
+	}
+	if e.httpClient == nil {
+		e.httpClient = http.DefaultClient
+	}
+	if opts.MaxInflight > 0 {
+		e.inflight = make(chan struct{}, opts.MaxInflight)
+	}
+	return e
+}
+
+// Identifier returns the provider key.
+func (e *Executor) Identifier() string { return providerKey }
+
+// Pool returns the captcha pool (may be nil).
+func (e *Executor) Pool() *captcha.Pool { return e.pool }
+
+// PrepareRequest is a no-op for playground auth (captcha is per-request).
+func (e *Executor) PrepareRequest(_ *http.Request, _ *coreauth.Auth) error { return nil }
+
+// Refresh returns auth unchanged.
+func (e *Executor) Refresh(_ context.Context, a *coreauth.Auth) (*coreauth.Auth, error) {
+	return a, nil
+}
+
+// HttpRequest injects nothing and executes via the shared client.
+func (e *Executor) HttpRequest(ctx context.Context, a *coreauth.Auth, req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, fmt.Errorf("nvidia executor: request is nil")
+	}
+	if ctx == nil {
+		ctx = req.Context()
+	}
+	httpReq := req.WithContext(ctx)
+	if err := e.PrepareRequest(httpReq, a); err != nil {
+		return nil, err
+	}
+	return e.httpClient.Do(httpReq)
+}
+
+// Execute handles non-streaming chat completions against NVIDIA predict.
+func (e *Executor) Execute(ctx context.Context, _ *coreauth.Auth, req clipexec.Request, opts clipexec.Options) (clipexec.Response, error) {
+	body, info, err := e.preparePayload(req, opts, false)
+	if err != nil {
+		return clipexec.Response{}, err
+	}
+	upResp, release, err := e.doPredict(ctx, info, body, opts)
+	if err != nil {
+		return clipexec.Response{}, err
+	}
+	defer release()
+	defer upResp.Body.Close()
+
+	raw, err := io.ReadAll(upResp.Body)
+	if err != nil {
+		return clipexec.Response{}, err
+	}
+	from := sdktranslator.FormatOpenAI
+	to := clipexec.ResponseFormatOrSource(opts)
+	out := sdktranslator.TranslateNonStream(ctx, from, to, req.Model, opts.OriginalRequest, body, raw, nil)
+	return clipexec.Response{Payload: out, Headers: upResp.Header.Clone()}, nil
+}
+
+// ExecuteStream handles streaming chat completions against NVIDIA predict.
+func (e *Executor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, req clipexec.Request, opts clipexec.Options) (*clipexec.StreamResult, error) {
+	body, info, err := e.preparePayload(req, opts, true)
+	if err != nil {
+		return nil, err
+	}
+	upResp, release, err := e.doPredict(ctx, info, body, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(chan clipexec.StreamChunk, 16)
+	go func() {
+		defer close(out)
+		defer release()
+		defer upResp.Body.Close()
+
+		from := sdktranslator.FormatOpenAI
+		to := clipexec.ResponseFormatOrSource(opts)
+		var param any
+
+		emitLine := func(line string) error {
+			chunks := sdktranslator.TranslateStream(ctx, from, to, req.Model, opts.OriginalRequest, body, []byte(line), &param)
+			for _, chunk := range chunks {
+				select {
+				case out <- clipexec.StreamChunk{Payload: chunk}:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		}
+
+		if err := coalesceSSEEvents(upResp.Body, e.coalesce, emitLine); err != nil && ctx.Err() == nil {
+			select {
+			case out <- clipexec.StreamChunk{Err: err}:
+			case <-ctx.Done():
+			}
+		}
+	}()
+
+	return &clipexec.StreamResult{Headers: upResp.Header.Clone(), Chunks: out}, nil
+}
+
+func (e *Executor) preparePayload(req clipexec.Request, opts clipexec.Options, stream bool) ([]byte, models.ModelInfo, error) {
+	from := opts.SourceFormat
+	if from == "" {
+		from = sdktranslator.FormatOpenAI
+	}
+	model := req.Model
+	payload, err := translateToChat(from, model, req.Payload, stream)
+	if err != nil {
+		var unsupported *UnsupportedFeatureError
+		if errors.As(err, &unsupported) {
+			return nil, models.ModelInfo{}, unsupportedRequestError(unsupported)
+		}
+		return nil, models.ModelInfo{}, requestErr(http.StatusBadRequest, "invalid json body")
+	}
+
+	body, err := NormalizeRequestBody(payload)
+	if err != nil {
+		return nil, models.ModelInfo{}, requestErr(http.StatusBadRequest, "invalid json body")
+	}
+
+	// Ensure stream flag matches the execution mode after translation.
+	body, err = forceStreamFlag(body, stream)
+	if err != nil {
+		return nil, models.ModelInfo{}, requestErr(http.StatusBadRequest, "invalid json body")
+	}
+
+	var modelProbe struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &modelProbe)
+	lookupModel := modelProbe.Model
+	if lookupModel == "" {
+		lookupModel = model
+	}
+	info, err := models.Lookup(lookupModel)
+	if err != nil {
+		if uerr, ok := err.(*models.ErrUnknownModel); ok {
+			return nil, models.ModelInfo{}, requestErr(http.StatusBadRequest, uerr.Error())
+		}
+		return nil, models.ModelInfo{}, err
+	}
+	if info.Capability != nil {
+		if err := validateChatCapabilities(body, lookupModel, *info.Capability); err != nil {
+			var unsupported *UnsupportedFeatureError
+			if errors.As(err, &unsupported) {
+				return nil, models.ModelInfo{}, unsupportedRequestError(unsupported)
+			}
+			return nil, models.ModelInfo{}, requestErr(http.StatusBadRequest, "invalid json body")
+		}
+	}
+	return body, info, nil
+}
+
+func unsupportedRequestError(unsupported *UnsupportedFeatureError) error {
+	payload, err := json.Marshal(struct {
+		Error struct {
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Param   string `json:"param"`
+		} `json:"error"`
+	}{
+		Error: struct {
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Param   string `json:"param"`
+		}{
+			Type:    "unsupported_feature",
+			Code:    "unsupported_feature",
+			Message: unsupported.Error(),
+			Param:   unsupported.Feature,
+		},
+	})
+	if err != nil {
+		return requestErr(http.StatusBadRequest, unsupported.Error())
+	}
+	return &coreauth.Error{
+		Message:    string(payload),
+		HTTPStatus: http.StatusBadRequest,
+	}
+}
+
+func forceStreamFlag(body []byte, stream bool) ([]byte, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	raw["stream"] = stream
+	if stream {
+		opts, _ := raw["stream_options"].(map[string]any)
+		if opts == nil {
+			opts = map[string]any{}
+			raw["stream_options"] = opts
+		}
+		if _, ok := opts["include_usage"]; !ok {
+			opts["include_usage"] = true
+		}
+		opts["continuous_usage_stats"] = false
+	}
+	return json.Marshal(raw)
+}
+
+func (e *Executor) doPredict(ctx context.Context, info models.ModelInfo, body []byte, opts clipexec.Options) (*http.Response, func(), error) {
+	clientToken := ""
+	if opts.Headers != nil {
+		clientToken = opts.Headers.Get("nv-captcha-token")
+	}
+	maxAttempts := 1
+	if clientToken == "" && (e.pool != nil || e.auto) {
+		maxAttempts = 3
+	}
+
+	var release func()
+	cleanup := func() {
+		if release != nil {
+			release()
+			release = nil
+		}
+	}
+
+	endpoint := info.PredictEndpoint()
+	if e.predictURL != nil {
+		endpoint = e.predictURL(info)
+	}
+
+	var upResp *http.Response
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		token, err := e.resolveCaptcha(ctx, clientToken, attempt == 1)
+		if err != nil {
+			cleanup()
+			return nil, nil, captchaErr(err)
+		}
+
+		rel, err := e.acquireInflight(ctx)
+		if err != nil {
+			cleanup()
+			return nil, nil, &coreauth.Error{
+				Code:       "request_scoped",
+				Message:    err.Error(),
+				HTTPStatus: http.StatusServiceUnavailable,
+			}
+		}
+		release = rel
+
+		upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			cleanup()
+			return nil, nil, err
+		}
+		upReq.Header.Set("Content-Type", "application/json")
+		upReq.Header.Set("Accept", "text/event-stream")
+		upReq.Header.Set("nv-function-id", info.FunctionID)
+		upReq.Header.Set("nv-captcha-token", token)
+		upReq.Header.Set("Origin", "https://build.nvidia.com")
+		upReq.Header.Set("Referer", "https://build.nvidia.com/")
+
+		upResp, err = e.httpClient.Do(upReq)
+		if err != nil {
+			cleanup()
+			return nil, nil, &coreauth.Error{
+				Code:       "upstream_error",
+				Message:    fmt.Sprintf("upstream: %v", err),
+				HTTPStatus: http.StatusBadGateway,
+			}
+		}
+
+		if upResp.StatusCode < 400 {
+			return upResp, cleanup, nil
+		}
+
+		raw, _ := io.ReadAll(io.LimitReader(upResp.Body, 4<<10))
+		status := upResp.StatusCode
+		_ = upResp.Body.Close()
+		upResp = nil
+		release()
+		release = nil
+
+		retryable := isRetryableCaptchaFailure(status, raw)
+		if retryable && attempt < maxAttempts {
+			log.Printf("upstream captcha failure status=%d (attempt %d/%d); fetching a fresh token",
+				status, attempt, maxAttempts)
+			continue
+		}
+		if retryable {
+			return nil, nil, &coreauth.Error{
+				Code:       "request_scoped",
+				Message:    "captcha token invalid or expired; retry the request",
+				HTTPStatus: http.StatusUnauthorized,
+			}
+		}
+		msg := strings.TrimSpace(string(raw))
+		if msg == "" {
+			msg = "upstream request failed"
+		}
+		return nil, nil, &coreauth.Error{
+			Code:       "upstream_error",
+			Message:    msg,
+			HTTPStatus: http.StatusBadGateway,
+		}
+	}
+	return nil, nil, &coreauth.Error{
+		Code:       "request_scoped",
+		Message:    "captcha token invalid or expired; retry the request",
+		HTTPStatus: http.StatusUnauthorized,
+	}
+}
+
+func (e *Executor) acquireInflight(ctx context.Context) (release func(), err error) {
+	if e.inflight == nil {
+		return func() {}, nil
+	}
+	release = func() { <-e.inflight }
+
+	if e.inflightWait <= 0 {
+		select {
+		case e.inflight <- struct{}{}:
+			return release, nil
+		default:
+			return nil, fmt.Errorf("max in-flight upstream streams reached; retry later")
+		}
+	}
+
+	timer := time.NewTimer(e.inflightWait)
+	defer timer.Stop()
+	select {
+	case e.inflight <- struct{}{}:
+		return release, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("max in-flight upstream streams reached; retry later")
+	case <-ctx.Done():
+		return nil, fmt.Errorf("client cancelled before a stream slot opened")
+	}
+}
+
+func (e *Executor) resolveCaptcha(ctx context.Context, clientToken string, allowFlag bool) (string, error) {
+	if clientToken != "" {
+		return clientToken, nil
+	}
+
+	if allowFlag {
+		e.mu.Lock()
+		flagToken := e.flagCaptcha
+		if flagToken != "" {
+			e.flagCaptcha = ""
+		}
+		e.mu.Unlock()
+		if flagToken != "" {
+			return flagToken, nil
+		}
+	}
+
+	if e.pool != nil {
+		takeCtx := ctx
+		var cancel context.CancelFunc
+		if e.captchaWait > 0 {
+			takeCtx, cancel = context.WithTimeout(ctx, e.captchaWait)
+			defer cancel()
+		}
+		if e.pool.Ready() == 0 {
+			waitFor := "indefinitely"
+			if e.captchaWait > 0 {
+				waitFor = e.captchaWait.String()
+			}
+			log.Printf("captcha pool empty; waiting up to %s (errors will surface from workers)", waitFor)
+		}
+		tok, err := e.pool.Take(takeCtx)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				fills, takes, errs, expired := e.pool.Stats()
+				return "", fmt.Errorf("captcha pool empty after %s (ready=%d fills=%d takes=%d errors=%d expired=%d); retry later",
+					e.captchaWait, e.pool.Ready(), fills, takes, errs, expired)
+			}
+			return "", err
+		}
+		return tok, nil
+	}
+	if e.auto {
+		return captcha.Extract(ctx)
+	}
+	return "", fmt.Errorf("captcha token required: send nv-captcha-token, or restart with -captcha / -auto")
+}
+
+func captchaErr(err error) error {
+	status := http.StatusUnauthorized
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "captcha pool empty after") {
+		status = http.StatusServiceUnavailable
+	} else if errors.Is(err, context.Canceled) {
+		status = http.StatusRequestTimeout
+	}
+	return &coreauth.Error{
+		Code:       "request_scoped",
+		Message:    err.Error(),
+		HTTPStatus: status,
+	}
+}
+
+func requestErr(status int, msg string) error {
+	return &coreauth.Error{
+		Code:       "request_scoped",
+		Message:    msg,
+		HTTPStatus: status,
+	}
+}
+
+// isRetryableCaptchaFailure reports whether an upstream 4xx is a captcha /
+// hCaptcha token failure fixed by fetching a fresh token and retrying.
+func isRetryableCaptchaFailure(status int, raw []byte) bool {
+	if status < 400 || status >= 500 {
+		return false
+	}
+	if len(raw) == 0 {
+		return false
+	}
+	var er glm52.ErrorResponse
+	if json.Unmarshal(raw, &er) == nil {
+		desc := strings.ToLower(er.RequestStatus.StatusDescription)
+		if strings.Contains(desc, "token is invalid") || strings.Contains(desc, "invalid token") {
+			return true
+		}
+		if er.RequestStatus.StatusCode == "INVALID_REQUEST" && strings.Contains(desc, "token") {
+			return true
+		}
+	}
+	low := strings.ToLower(string(raw))
+	if strings.Contains(low, "token is invalid") {
+		return true
+	}
+	return strings.Contains(low, "captcha") || strings.Contains(low, "hcaptcha")
+}

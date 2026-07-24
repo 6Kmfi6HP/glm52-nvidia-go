@@ -8,20 +8,31 @@
 [![Status](https://img.shields.io/badge/Status-Reverse_Engineered-yellow)](#逆向分析报告)
 ![Platforms](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
 
-> **English:** A reverse-engineered Go client and OpenAI-compatible reverse proxy for **NVIDIA Playground's [GLM-5.2](https://build.nvidia.com/z-ai/glm-5.2/playground)** LLM (753B MoE, 1M context, thinking/tool-calling/streaming). It automates one-shot **hCaptcha** credentials with headless Chromium (chromedp), runs a prewarmed captcha token pool, exposes an OpenAI Chat Completions endpoint, and ships with Docker deployment and SSE/latency benchmarks.
+> **English:** A reverse-engineered Go client and multi-format reverse proxy for **NVIDIA Playground's [GLM-5.2](https://build.nvidia.com/z-ai/glm-5.2/playground)** LLM (753B MoE, 1M context, thinking/tool-calling/streaming). It automates one-shot **hCaptcha** credentials with headless Chromium (chromedp), runs a prewarmed captcha token pool, embeds [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) to expose OpenAI Chat Completions, OpenAI Responses, and Claude Messages, and ships with Docker deployment and SSE/latency benchmarks. Inbound gateway API keys are **not** enabled.
 
-**中文:** 逆向工程 NVIDIA Playground 的 API 调用，实现 Go 语言本地调用 [GLM-5.2](https://build.nvidia.com/z-ai/glm-5.2/playground)（753B MoE、1M 上下文、思维链/工具调用/流式输出）。通过 headless Chromium（chromedp）自动化 hCaptcha 凭证，维护预热 token 池，对外提供 OpenAI Chat Completions 兼容端点，含 Docker 部署与 SSE/延迟基准。
+**中文:** 逆向工程 NVIDIA Playground 的 API 调用，实现 Go 语言本地调用 [GLM-5.2](https://build.nvidia.com/z-ai/glm-5.2/playground)（753B MoE、1M 上下文、思维链/工具调用/流式输出）。通过 headless Chromium（chromedp）自动化 hCaptcha 凭证，维护预热 token 池，嵌入 CLIProxyAPI 对外提供 OpenAI Chat Completions / Responses 与 Claude Messages，含 Docker 部署与 SSE/延迟基准。**不**启用网关入站 api-keys 校验。
 
 ### 快速开始
 
 ```bash
-# 一键启动 OpenAI 兼容代理（内置 Chromium + captcha 预热池）
+# 一键启动多格式代理（内置 Chromium + captcha 预热池；依赖 CLIProxyAPI 内置翻译器）
 go run ./cmd/serve -auto -addr :8080
 
-# 调用（与 OpenAI SDK 兼容）
+# OpenAI Chat Completions
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+
+# OpenAI Responses
+curl http://localhost:8080/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"z-ai/glm-5.2","input":"Hi","stream":true}'
+
+# Claude Messages
+curl http://localhost:8080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"z-ai/glm-5.2","max_tokens":256,"messages":[{"role":"user","content":"Hi"}],"stream":true}'
 ```
 
 或直接跑已发布镜像：
@@ -191,9 +202,9 @@ client := glm52.New(glm52.WithCaptchaToken(token))
 | API 兼容 | OpenAI Chat Completions 格式 |
 | 部署 | Docker NIM: `nvcr.io/nim/zai-org/glm-5.2:latest` |
 
-### 方式 3：OpenAI 兼容本地代理
+### 方式 3：多格式本地代理（CLIProxyAPI）
 
-上游 predict API 本身就是 Chat Completions 格式，`serve` 只做 captcha 头适配与透传。**每个 captcha token 只能用于一次上游请求。**
+上游 predict API 本身就是 Chat Completions 格式。`serve` 嵌入 CLIProxyAPI 网关：内置翻译器把 Claude `/v1/messages` 与 OpenAI `/v1/responses` 转成 openai chat，再由 nvidia ProviderExecutor 注入 captcha / `nv-function-id` 并调用 predict。**不**配置网关 `api-keys`（入站无 Key 校验）。**每个 captcha token 只能用于一次上游请求。**
 
 ```bash
 # 共享 Chrome + captcha 预热池（启动默认：pool=3 workers=1 coalesce=16ms，先预热再接流量）
@@ -208,12 +219,23 @@ go run ./cmd/serve -auto -pool-size=2 -pool-workers=2 -coalesce-ms=0 -max-inflig
 # 跳过启动预热（不推荐：首请求 TTFT 会含整段 captcha 提取）
 go run ./cmd/serve -auto -warm-timeout=0
 
-# 调用（与 OpenAI SDK 兼容；serve 默认注入 enable_thinking，与 Playground 一致）
+# OpenAI Chat Completions（serve 默认注入 enable_thinking，与 Playground 一致）
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"Which is larger, 9.11 or 9.8?"}],"stream":true}'
 
-# 显式关闭思维链
+# OpenAI Responses
+curl http://localhost:8080/v1/responses \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"z-ai/glm-5.2","input":"Hi","stream":true}'
+
+# Claude Messages
+curl http://localhost:8080/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{"model":"z-ai/glm-5.2","max_tokens":256,"messages":[{"role":"user","content":"Hi"}],"stream":true}'
+
+# 显式关闭思维链（Chat Completions）
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"Hi"}],"stream":true,"chat_template_kwargs":{"enable_thinking":false}}'
@@ -222,7 +244,7 @@ curl http://localhost:8080/v1/chat/completions \
 curl -s http://localhost:8080/healthz
 ```
 
-也可在请求头携带 `nv-captcha-token` 提供一次性 token。流式优化：关闭 `continuous_usage_stats`、SSE 逐写 Flush、可选 content coalesce；`-auto` 时后台预热 token，请求路径只从池中取。池内 token 默认 **90s TTL**，过期丢弃；上游返回 `Token is invalid` 时自动换新 token 最多重试 2 次。
+也可在请求头携带 `nv-captcha-token` 提供一次性 token。流式优化：关闭 `continuous_usage_stats`、可选 content coalesce；`-auto` 时后台预热 token，请求路径只从池中取。池内 token 默认 **90s TTL**，过期丢弃；上游返回 `Token is invalid` 时自动换新 token 最多重试 2 次。端到端调用仍需 `-auto` / `-captcha` / 请求头 captcha（与现网一致）。
 
 流式时序 / 并发实验：
 
@@ -278,8 +300,9 @@ glm52-nvidia-go/
 ├── client.go             # 客户端实现（hCaptcha token + SSE 流式，按 model 路由）
 ├── internal/captcha/     # 共享 Chrome、token 预热池、一次性提取
 ├── internal/models/      # Playground 模型注册表（slug/namespace/function-id）
+├── internal/provider/nvidia/  # CLIProxyAPI ProviderExecutor（captcha + predict）
 ├── cmd/example/          # 命令行示例（-smooth-ms 打字机输出）
-├── cmd/serve/            # OpenAI Chat Completions 兼容代理
+├── cmd/serve/            # 多格式网关（CLIProxyAPI：chat/completions + responses + messages）
 ├── cmd/streambench/      # SSE 时序 + 并发实验（-concurrency）
 ├── scripts/scrape_playground_models.py  # 爬取 playground 模型 + function-id
 ├── Dockerfile            # Chromium + serve 多阶段构建
