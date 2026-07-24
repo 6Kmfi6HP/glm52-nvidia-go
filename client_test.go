@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -104,5 +105,53 @@ func TestApplyDefaultsFillsEmptyKwargs(t *testing.T) {
 	client.applyDefaults(req)
 	if req.ChatTemplateKwargs["enable_thinking"] != true {
 		t.Fatalf("empty kwargs should get defaults, got %#v", req.ChatTemplateKwargs)
+	}
+}
+
+// buildRequest must route each model to its own NVCF endpoint + function-id, not
+// a single hardcoded GLM endpoint. Pinned to two concrete registry entries so a
+// future scrape that changes their ids is caught here.
+func TestBuildRequestRoutesPerModel(t *testing.T) {
+	client := New(WithCaptchaToken("tok"))
+	cases := map[string]struct {
+		endpoint string
+		fnID     string
+	}{
+		"z-ai/glm-5.2": {
+			"https://api.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/glm-5.2",
+			"3b9748d8-1d85-40e8-8573-0eeaa63a4b63",
+		},
+		"moonshotai/kimi-k2.6": {
+			"https://api.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/kimi-k2.6",
+			"23d4f03a-b8a6-4adb-a183-7daa083a09cc",
+		},
+	}
+	for model, want := range cases {
+		req, err := client.buildRequest(context.Background(), &ChatRequest{
+			Model: model, Messages: []Message{{Role: RoleUser, Content: "Hi"}},
+		})
+		if err != nil {
+			t.Errorf("%s: buildRequest: %v", model, err)
+			continue
+		}
+		if got := req.URL.String(); got != want.endpoint {
+			t.Errorf("%s: endpoint = %q want %q", model, got, want.endpoint)
+		}
+		if got := req.Header.Get("nv-function-id"); got != want.fnID {
+			t.Errorf("%s: nv-function-id = %q want %q", model, got, want.fnID)
+		}
+	}
+}
+
+func TestBuildRequestUnknownModel(t *testing.T) {
+	client := New(WithCaptchaToken("tok"))
+	_, err := client.buildRequest(context.Background(), &ChatRequest{
+		Model: "no-such-org/never", Messages: []Message{{Role: RoleUser, Content: "Hi"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown model")
+	}
+	if !strings.Contains(err.Error(), "no-such-org/never") {
+		t.Fatalf("error %q should name the model", err.Error())
 	}
 }

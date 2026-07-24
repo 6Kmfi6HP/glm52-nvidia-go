@@ -49,6 +49,27 @@ docker run --rm -p 8080:8080 --shm-size=2g ghcr.io/6kmfi6hp/glm52-nvidia-go:late
 | **队列检查** | `GET https://api.ngc.nvidia.com/v2/predict/queues/models/qc69jvmznzxy/glm-5.2` |
 | **API 文档** | https://docs.api.nvidia.com/nim/reference/z-ai-glm-5-2 |
 
+### 多模型支持
+
+每个 build.nvidia.com Playground 模型都有独立的 `slug`（端点路径）与 `nv-function-id`，namespace `qc69jvmznzxy` 全模型共享。`internal/models` 持有一份已爬取的注册表（53 个 chat playground 模型，含 `z-ai/glm-5.2`、`moonshotai/kimi-k2.6`、`nvidia/nemotron-*`、`openai/gpt-oss-*`、`qwen/qwen3.5-*` 等）。
+
+注册表由 `scripts/scrape_playground_models.py` 生成：拉取 `https://integrate.api.nvidia.com/v1/models` 的全量 id 列表，逐个抓 `/{id}/playground` 页面，解析 SSR 内联的 `nvcfFunctionId`+`namespace`。刷新：
+
+```bash
+python3 scripts/scrape_playground_models.py > scripts/playground_models.json
+# 然后按 scripts/playground_models.json 更新 internal/models/registry.go 的 Models map
+```
+
+请求体里指定任意注册表内模型即可路由到对应端点（serve 与 Go client 都按 `model` 查表拼 URL + 注入对应 `nv-function-id`；未知模型返回 400）：
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"moonshotai/kimi-k2.6","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+```
+
+未纳入的模型（如 `ibm/granite-*-code-instruct`、`nv-mistralai/mistral-nemo-12b`）其 `/playground` 页把 `nvcfFunctionId` 渲染为 `"None"`——function-id 只在运行时解析，抓不到。需要在真实页面里驱动一下才能补全（`moonshotai/kimi-k2.6` 即以此方式补入）。
+
 ### 认证机制
 
 Playground **不**使用 API Key 认证，而是使用 **hCaptcha token** 机制：
@@ -254,11 +275,13 @@ git push origin v0.1.0
 ```
 glm52-nvidia-go/
 ├── types.go              # 类型定义（ChatRequest、Message、Chunk 等）
-├── client.go             # 客户端实现（hCaptcha token + SSE 流式）
+├── client.go             # 客户端实现（hCaptcha token + SSE 流式，按 model 路由）
 ├── internal/captcha/     # 共享 Chrome、token 预热池、一次性提取
+├── internal/models/      # Playground 模型注册表（slug/namespace/function-id）
 ├── cmd/example/          # 命令行示例（-smooth-ms 打字机输出）
 ├── cmd/serve/            # OpenAI Chat Completions 兼容代理
 ├── cmd/streambench/      # SSE 时序 + 并发实验（-concurrency）
+├── scripts/scrape_playground_models.py  # 爬取 playground 模型 + function-id
 ├── Dockerfile            # Chromium + serve 多阶段构建
 └── docker-compose.yml    # 本地一键启动（shm_size=2g）
 ```
