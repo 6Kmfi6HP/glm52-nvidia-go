@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"glm52-nvidia/internal/models"
 )
 
 // --- Client ---
@@ -86,18 +88,27 @@ func New(opts ...Option) *Client {
 // --- internal request helpers ---
 
 func (c *Client) buildRequest(ctx context.Context, req *ChatRequest) (*http.Request, error) {
+	model := req.Model
+	if model == "" {
+		model = c.model
+	}
+	info, err := models.Lookup(model)
+	if err != nil {
+		return nil, fmt.Errorf("glm52: %w", err)
+	}
+
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("glm52: marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", PredictEndpoint, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", info.PredictEndpoint(), bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("glm52: create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("accept", "text/event-stream")
-	httpReq.Header.Set("nv-function-id", NVFunctionID)
+	httpReq.Header.Set("nv-function-id", info.FunctionID)
 	httpReq.Header.Set("nv-captcha-token", c.captchaToken)
 	httpReq.Header.Set("Origin", "https://build.nvidia.com")
 	httpReq.Header.Set("Referer", "https://build.nvidia.com/")

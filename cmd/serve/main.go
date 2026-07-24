@@ -32,12 +32,14 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	glm52 "glm52-nvidia"
 	"glm52-nvidia/internal/captcha"
+	"glm52-nvidia/internal/models"
 )
 
 // Set via -ldflags "-X main.version=v1.2.3" at release build time.
@@ -141,6 +143,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("GET /v1/models", s.handleModels)
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
@@ -171,6 +174,30 @@ type server struct {
 
 	mu          sync.Mutex
 	flagCaptcha string // emptied after first successful take
+}
+
+func (s *server) handleModels(w http.ResponseWriter, _ *http.Request) {
+	// Standard OpenAI GET /v1/models shape: {"object":"list","data":[{id,object,
+	// created,owned_by}]}. We do not track per-model creation timestamps in the
+	// registry, so `created` is a fixed placeholder; clients that actually need
+	// it should query integrate.api.nvidia.com/v1/models directly.
+	data := make([]map[string]any, 0, len(models.Models))
+	for id := range models.Models {
+		org, _, _ := strings.Cut(id, "/")
+		data = append(data, map[string]any{
+			"id":       id,
+			"object":   "model",
+			"created":  0,
+			"owned_by": org,
+		})
+	}
+	// Stable ordering for diff-friendly output.
+	sort.Slice(data, func(i, j int) bool {
+		return data[i]["id"].(string) < data[j]["id"].(string)
+	})
+	out := map[string]any{"object": "list", "data": data}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -223,6 +250,23 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve the requested model to its NVCF endpoint + function id. An empty
+	// model defaults to glm-5.2; an unknown model is rejected before we spend a
+	// one-shot captcha token on an upstream call that would 404.
+	var modelProbe struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &modelProbe)
+	info, err := models.Lookup(modelProbe.Model)
+	if err != nil {
+		if uerr, ok := err.(*models.ErrUnknownModel); ok {
+			httpError(w, http.StatusBadRequest, uerr.Error())
+			return
+		}
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	clientToken := r.Header.Get("nv-captcha-token")
 	// Client-supplied tokens are not retried (caller owns them). Pool/auto can refresh.
 	maxAttempts := 1
@@ -267,14 +311,14 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		release = rel
 
-		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, glm52.PredictEndpoint, bytes.NewReader(body))
+		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, info.PredictEndpoint(), bytes.NewReader(body))
 		if err != nil {
 			httpError(w, http.StatusInternalServerError, "failed to create upstream request")
 			return
 		}
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("Accept", "text/event-stream")
-		upReq.Header.Set("nv-function-id", glm52.NVFunctionID)
+		upReq.Header.Set("nv-function-id", info.FunctionID)
 		upReq.Header.Set("nv-captcha-token", token)
 		upReq.Header.Set("Origin", "https://build.nvidia.com")
 		upReq.Header.Set("Referer", "https://build.nvidia.com/")

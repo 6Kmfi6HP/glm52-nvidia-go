@@ -24,6 +24,7 @@ import (
 func main() {
 	captcha := flag.String("captcha", "", "hCaptcha token (reverse-engineered mode)")
 	auto := flag.Bool("auto", false, "Auto-extract captcha token via chromedp")
+	model := flag.String("model", "", "model id (e.g. moonshotai/kimi-k2.6); empty = z-ai/glm-5.2")
 	prompt := flag.String("prompt", "Explain the meaning of life in one sentence.", "prompt to send")
 	stream := flag.Bool("stream", true, "use streaming")
 	smoothMs := flag.Int("smooth-ms", 12, "typewriter delay per rune for stream output (0=off)")
@@ -32,24 +33,30 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// --- Build client ---
-	var client *glm52.Client
+	// --- Build client (model + captcha from flags) ---
 
+	var token string
 	switch {
 	case *auto:
-		token, err := extractCaptchaToken(ctx)
+		t, err := extractCaptchaToken(ctx)
 		if err != nil {
 			log.Fatalf("Failed to auto-extract captcha token: %v", err)
 		}
+		token = t
 		fmt.Printf("✓ Extracted captcha token: %s...\n", token[:30])
-		client = glm52.New(glm52.WithCaptchaToken(token))
 
 	case *captcha != "":
-		client = glm52.New(glm52.WithCaptchaToken(*captcha))
+		token = *captcha
 
 	default:
 		log.Fatal("Specify -captcha or -auto")
 	}
+
+	opts := []glm52.Option{glm52.WithCaptchaToken(token)}
+	if *model != "" {
+		opts = append(opts, glm52.WithModel(*model))
+	}
+	client := glm52.New(opts...)
 
 	// --- Send request ---
 	messages := []glm52.Message{
