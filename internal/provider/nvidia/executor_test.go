@@ -425,12 +425,13 @@ func TestExecute_sendsResponsesSamplingFieldsToPlayground(t *testing.T) {
 	}
 }
 
-func TestExecute_rejectsUnsupportedFeatureBeforePlayground(t *testing.T) {
+func TestExecute_forwardsResponsesStoreWithoutRejecting(t *testing.T) {
 	// Given: a Playground server that records whether it was contacted.
 	hits := 0
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits++
-		w.WriteHeader(http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
 	}))
 	defer up.Close()
 	executor := NewExecutor(Options{
@@ -439,40 +440,21 @@ func TestExecute_rejectsUnsupportedFeatureBeforePlayground(t *testing.T) {
 		PredictURL:  func(models.ModelInfo) string { return up.URL },
 	})
 
-	// When: GLM-5.2 receives structured output that its declared capability excludes.
+	// When: a Responses request includes store (unsupported by NVIDIA, but must not be rejected).
 	_, err := executor.Execute(context.Background(), nil, clipexec.Request{
 		Model: "z-ai/glm-5.2",
 		Payload: []byte(`{
 			"model":"z-ai/glm-5.2",
 			"input":"hello",
-			"text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object"}}}
+			"store":true
 		}`),
 	}, clipexec.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
 
-	// Then: the executor returns a stable client error without contacting NVIDIA.
-	if hits != 0 {
+	// Then: the request proceeds to NVIDIA instead of returning unsupported_feature.
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hits != 1 {
 		t.Fatalf("upstream hits=%d", hits)
-	}
-	authError, ok := err.(*coreauth.Error)
-	if !ok {
-		t.Fatalf("error type=%T value=%v", err, err)
-	}
-	if authError.HTTPStatus != http.StatusBadRequest {
-		t.Fatalf("error=%+v", authError)
-	}
-	var errorBody struct {
-		Error struct {
-			Type  string `json:"type"`
-			Code  string `json:"code"`
-			Param string `json:"param"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(authError.Message), &errorBody); err != nil {
-		t.Fatalf("decode error response: %v; message=%q", err, authError.Message)
-	}
-	if errorBody.Error.Type != "unsupported_feature" ||
-		errorBody.Error.Code != "unsupported_feature" ||
-		errorBody.Error.Param != "response_format" {
-		t.Fatalf("error body=%+v", errorBody)
 	}
 }

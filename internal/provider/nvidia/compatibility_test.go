@@ -2,10 +2,7 @@ package nvidia
 
 import (
 	"encoding/json"
-	"errors"
 	"testing"
-
-	"glm52-nvidia/internal/models"
 
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 
@@ -83,71 +80,52 @@ func TestTranslateToChat_preservesClaudeTemperatureAndTopP(t *testing.T) {
 	}
 }
 
-func TestTranslateToChat_rejectsUnsupportedPlatformFeatures(t *testing.T) {
+func TestTranslateToChat_ignoresUnsupportedPlatformFeatures(t *testing.T) {
 	tests := []struct {
 		name    string
 		format  sdktranslator.Format
 		request string
-		feature string
 	}{
+		{
+			name:    "responses store",
+			format:  sdktranslator.FormatOpenAIResponse,
+			request: `{"model":"z-ai/glm-5.2","input":"hello","store":true}`,
+		},
 		{
 			name:    "responses state",
 			format:  sdktranslator.FormatOpenAIResponse,
 			request: `{"model":"z-ai/glm-5.2","input":"hello","previous_response_id":"resp_1"}`,
-			feature: "previous_response_id",
 		},
 		{
 			name:    "responses hosted tool",
 			format:  sdktranslator.FormatOpenAIResponse,
 			request: `{"model":"z-ai/glm-5.2","input":"hello","tools":[{"type":"web_search_preview"}]}`,
-			feature: "tools.web_search_preview",
 		},
 		{
 			name:    "responses input file",
 			format:  sdktranslator.FormatOpenAIResponse,
 			request: `{"model":"z-ai/glm-5.2","input":[{"role":"user","content":[{"type":"input_file","file_id":"file_1"}]}]}`,
-			feature: "input_file",
 		},
 		{
 			name:    "claude document",
 			format:  sdktranslator.FormatClaude,
 			request: `{"model":"z-ai/glm-5.2","max_tokens":32,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","data":"AA=="}}]}]}`,
-			feature: "document",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			// Given: a source request that requires a hosted or stateful platform feature.
-			// When: it is translated to stateless Chat Completions.
-			_, err := translateToChat(test.format, "z-ai/glm-5.2", []byte(test.request), false)
+			// Given: a source request that includes platform-only fields.
+			// When: it is translated to Chat Completions.
+			got, err := translateToChat(test.format, "z-ai/glm-5.2", []byte(test.request), false)
 
-			// Then: translation fails explicitly and identifies the unsupported feature.
-			var unsupported *UnsupportedFeatureError
-			if !errors.As(err, &unsupported) {
-				t.Fatalf("error type=%T value=%v", err, err)
+			// Then: translation succeeds; unsupported fields are dropped by translation.
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
-			if unsupported.Feature != test.feature {
-				t.Fatalf("feature=%q want %q", unsupported.Feature, test.feature)
+			if len(got) == 0 {
+				t.Fatal("empty translated body")
 			}
 		})
-	}
-}
-
-func TestValidateChatCapabilities_rejectsUnsupportedModelFeature(t *testing.T) {
-	// Given: a model whose declared Playground capability does not include tools.
-	capability := models.ModelCapability{}
-	request := []byte(`{"model":"z-ai/glm-5.2","messages":[],"tools":[{"type":"function","function":{"name":"lookup"}}]}`)
-
-	// When: the final canonical Chat request is checked.
-	err := validateChatCapabilities(request, "z-ai/glm-5.2", capability)
-
-	// Then: the model-specific incompatibility is explicit.
-	var unsupported *UnsupportedFeatureError
-	if !errors.As(err, &unsupported) {
-		t.Fatalf("error type=%T value=%v", err, err)
-	}
-	if unsupported.Feature != "tools" {
-		t.Fatalf("feature=%q", unsupported.Feature)
 	}
 }

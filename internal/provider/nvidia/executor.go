@@ -179,10 +179,6 @@ func (e *Executor) preparePayload(req clipexec.Request, opts clipexec.Options, s
 	model := req.Model
 	payload, err := translateToChat(from, model, req.Payload, stream)
 	if err != nil {
-		var unsupported *UnsupportedFeatureError
-		if errors.As(err, &unsupported) {
-			return nil, models.ModelInfo{}, unsupportedRequestError(unsupported)
-		}
 		return nil, models.ModelInfo{}, requestErr(http.StatusBadRequest, "invalid json body")
 	}
 
@@ -212,46 +208,7 @@ func (e *Executor) preparePayload(req clipexec.Request, opts clipexec.Options, s
 		}
 		return nil, models.ModelInfo{}, err
 	}
-	if info.Capability != nil {
-		if err := validateChatCapabilities(body, lookupModel, *info.Capability); err != nil {
-			var unsupported *UnsupportedFeatureError
-			if errors.As(err, &unsupported) {
-				return nil, models.ModelInfo{}, unsupportedRequestError(unsupported)
-			}
-			return nil, models.ModelInfo{}, requestErr(http.StatusBadRequest, "invalid json body")
-		}
-	}
 	return body, info, nil
-}
-
-func unsupportedRequestError(unsupported *UnsupportedFeatureError) error {
-	payload, err := json.Marshal(struct {
-		Error struct {
-			Type    string `json:"type"`
-			Code    string `json:"code"`
-			Message string `json:"message"`
-			Param   string `json:"param"`
-		} `json:"error"`
-	}{
-		Error: struct {
-			Type    string `json:"type"`
-			Code    string `json:"code"`
-			Message string `json:"message"`
-			Param   string `json:"param"`
-		}{
-			Type:    "unsupported_feature",
-			Code:    "unsupported_feature",
-			Message: unsupported.Error(),
-			Param:   unsupported.Feature,
-		},
-	})
-	if err != nil {
-		return requestErr(http.StatusBadRequest, unsupported.Error())
-	}
-	return &coreauth.Error{
-		Message:    string(payload),
-		HTTPStatus: http.StatusBadRequest,
-	}
 }
 
 func forceStreamFlag(body []byte, stream bool) ([]byte, error) {
