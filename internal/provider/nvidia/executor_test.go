@@ -331,3 +331,148 @@ func TestExecuteUsesHeaderCaptcha(t *testing.T) {
 		t.Fatalf("payload=%s", resp.Payload)
 	}
 }
+
+func TestExecuteTranslatesReasoningEffortForUpstreamModel(t *testing.T) {
+	var upstreamBody map[string]any
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"1","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer up.Close()
+
+	executor := NewExecutor(Options{
+		FlagCaptcha: "test-token",
+		HTTPClient:  up.Client(),
+		PredictURL:  func(models.ModelInfo) string { return up.URL },
+	})
+	_, err := executor.Execute(context.Background(), nil, clipexec.Request{
+		Model: "deepseek-ai/deepseek-v4-pro",
+		Payload: []byte(`{
+			"model":"deepseek-ai/deepseek-v4-pro",
+			"messages":[{"role":"user","content":"solve"}],
+			"reasoning_effort":"xhigh"
+		}`),
+	}, clipexec.Options{SourceFormat: sdktranslator.FormatOpenAI})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kwargs, ok := upstreamBody["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		t.Fatalf("upstream chat_template_kwargs missing: %#v", upstreamBody)
+	}
+	if got := kwargs["reasoning_effort"]; got != "max" {
+		t.Fatalf("upstream reasoning_effort=%#v want max", got)
+	}
+	if _, ok := upstreamBody["reasoning_effort"]; ok {
+		t.Fatalf("generic reasoning_effort leaked upstream: %#v", upstreamBody)
+	}
+}
+
+func TestExecute_sendsResponsesSamplingFieldsToPlayground(t *testing.T) {
+	// Given: a capture server standing in for the NVIDIA Chat Completions endpoint.
+	var upstreamBody map[string]json.RawMessage
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&upstreamBody); err != nil {
+			t.Errorf("decode upstream request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"1","choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+	}))
+	defer up.Close()
+	executor := NewExecutor(Options{
+		FlagCaptcha: "test-token",
+		HTTPClient:  up.Client(),
+		PredictURL:  func(models.ModelInfo) string { return up.URL },
+	})
+
+	// When: a Responses request uses Chat-compatible sampling and attribution fields.
+	_, err := executor.Execute(context.Background(), nil, clipexec.Request{
+		Model: "z-ai/glm-5.2",
+		Payload: []byte(`{
+			"model":"z-ai/glm-5.2",
+			"input":"hello",
+			"temperature":0.25,
+			"top_p":0.8,
+			"user":"user-42",
+			"service_tier":"default"
+		}`),
+	}, clipexec.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Then: the captured canonical Chat request retains every compatible field.
+	for field, want := range map[string]string{
+		"temperature":  "0.25",
+		"top_p":        "0.8",
+		"user":         `"user-42"`,
+		"service_tier": `"default"`,
+	} {
+		if got := string(upstreamBody[field]); got != want {
+			t.Errorf("%s=%s want %s; body=%v", field, got, want, upstreamBody)
+		}
+	}
+	if string(upstreamBody["stream"]) != "false" {
+		t.Fatalf("stream=%s", upstreamBody["stream"])
+	}
+}
+
+func TestExecute_rejectsUnsupportedFeatureBeforePlayground(t *testing.T) {
+	// Given: a Playground server that records whether it was contacted.
+	hits := 0
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer up.Close()
+	executor := NewExecutor(Options{
+		FlagCaptcha: "test-token",
+		HTTPClient:  up.Client(),
+		PredictURL:  func(models.ModelInfo) string { return up.URL },
+	})
+
+	// When: GLM-5.2 receives structured output that its declared capability excludes.
+	_, err := executor.Execute(context.Background(), nil, clipexec.Request{
+		Model: "z-ai/glm-5.2",
+		Payload: []byte(`{
+			"model":"z-ai/glm-5.2",
+			"input":"hello",
+			"text":{"format":{"type":"json_schema","name":"answer","schema":{"type":"object"}}}
+		}`),
+	}, clipexec.Options{SourceFormat: sdktranslator.FormatOpenAIResponse})
+
+	// Then: the executor returns a stable client error without contacting NVIDIA.
+	if hits != 0 {
+		t.Fatalf("upstream hits=%d", hits)
+	}
+	authError, ok := err.(*coreauth.Error)
+	if !ok {
+		t.Fatalf("error type=%T value=%v", err, err)
+	}
+	if authError.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("error=%+v", authError)
+	}
+	var errorBody struct {
+		Error struct {
+			Type  string `json:"type"`
+			Code  string `json:"code"`
+			Param string `json:"param"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(authError.Message), &errorBody); err != nil {
+		t.Fatalf("decode error response: %v; message=%q", err, authError.Message)
+	}
+	if errorBody.Error.Type != "unsupported_feature" ||
+		errorBody.Error.Code != "unsupported_feature" ||
+		errorBody.Error.Param != "response_format" {
+		t.Fatalf("error body=%+v", errorBody)
+	}
+}

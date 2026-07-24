@@ -89,15 +89,6 @@ func (e *Executor) Refresh(_ context.Context, a *coreauth.Auth) (*coreauth.Auth,
 	return a, nil
 }
 
-// CountTokens is not supported for the playground surface.
-func (e *Executor) CountTokens(context.Context, *coreauth.Auth, clipexec.Request, clipexec.Options) (clipexec.Response, error) {
-	return clipexec.Response{}, &coreauth.Error{
-		Code:       "not_implemented",
-		Message:    "count tokens not implemented",
-		HTTPStatus: http.StatusNotImplemented,
-	}
-}
-
 // HttpRequest injects nothing and executes via the shared client.
 func (e *Executor) HttpRequest(ctx context.Context, a *coreauth.Auth, req *http.Request) (*http.Response, error) {
 	if req == nil {
@@ -185,11 +176,14 @@ func (e *Executor) preparePayload(req clipexec.Request, opts clipexec.Options, s
 	if from == "" {
 		from = sdktranslator.FormatOpenAI
 	}
-	to := sdktranslator.FormatOpenAI
 	model := req.Model
-	payload := sdktranslator.TranslateRequest(from, to, model, req.Payload, stream)
-	if len(payload) == 0 {
-		payload = req.Payload
+	payload, err := translateToChat(from, model, req.Payload, stream)
+	if err != nil {
+		var unsupported *UnsupportedFeatureError
+		if errors.As(err, &unsupported) {
+			return nil, models.ModelInfo{}, unsupportedRequestError(unsupported)
+		}
+		return nil, models.ModelInfo{}, requestErr(http.StatusBadRequest, "invalid json body")
 	}
 
 	body, err := NormalizeRequestBody(payload)
@@ -218,7 +212,46 @@ func (e *Executor) preparePayload(req clipexec.Request, opts clipexec.Options, s
 		}
 		return nil, models.ModelInfo{}, err
 	}
+	if info.Capability != nil {
+		if err := validateChatCapabilities(body, lookupModel, *info.Capability); err != nil {
+			var unsupported *UnsupportedFeatureError
+			if errors.As(err, &unsupported) {
+				return nil, models.ModelInfo{}, unsupportedRequestError(unsupported)
+			}
+			return nil, models.ModelInfo{}, requestErr(http.StatusBadRequest, "invalid json body")
+		}
+	}
 	return body, info, nil
+}
+
+func unsupportedRequestError(unsupported *UnsupportedFeatureError) error {
+	payload, err := json.Marshal(struct {
+		Error struct {
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Param   string `json:"param"`
+		} `json:"error"`
+	}{
+		Error: struct {
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Param   string `json:"param"`
+		}{
+			Type:    "unsupported_feature",
+			Code:    "unsupported_feature",
+			Message: unsupported.Error(),
+			Param:   unsupported.Feature,
+		},
+	})
+	if err != nil {
+		return requestErr(http.StatusBadRequest, unsupported.Error())
+	}
+	return &coreauth.Error{
+		Message:    string(payload),
+		HTTPStatus: http.StatusBadRequest,
+	}
 }
 
 func forceStreamFlag(body []byte, stream bool) ([]byte, error) {
