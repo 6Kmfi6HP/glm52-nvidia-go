@@ -18,27 +18,25 @@ linters:
     - usestdlibvars
     - errorlint
     - copyloopvar
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+    misspell:
+      locale: US
+    errcheck:
+      check-blank: true
 
 formatters:
   enable:
     - gofmt
     - goimports
 
-linters-settings:
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - performance
-      - style
-  misspell:
-    locale: US
-  errcheck:
-    check-blank: true
-
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-use-default: false
 
 run:
   timeout: 5m
