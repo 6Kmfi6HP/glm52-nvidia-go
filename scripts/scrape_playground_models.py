@@ -1,109 +1,132 @@
 #!/usr/bin/env python3
-"""Scrape build.nvidia.com for which /v1/models entries have a chat Playground
-and record their NVCF namespace + function id.
+"""Scrape https://build.nvidia.com/models for the complete NIM model registry.
 
-Why two sources:
-  - https://integrate.api.nvidia.com/v1/models  lists EVERY model id (the
-    anonymous catalog). Returns OpenAI-style {"data":[{"id":...}]}.
-  - https://build.nvidia.com/{model}/playground  is the chat UI page. Next.js
-    server-renders the model descriptor as *escaped* JSON inside the HTML, e.g.
-        ...(\"namespace\":\"qc69jvmznzxy\",...,\"nvcfFunctionId\":\"<uuid>\")...
+Data source:
+  https://build.nvidia.com/models?pageSize=200\
+  &filters=nimType%3Anim_type_preview%2CnimType%3Anim_type_upgrade_available
 
-A model whose /playground page contains an \"nvcfFunctionId\":\"<uuid>\" is a
-real chat playground model; one whose value is the literal string \"None\" or
-that omits the key is either not a chat playground (no namespace) or is a
-playground whose function id is resolved at runtime rather than inlined.
+  The filter URL shows only models with interactive playgrounds (preview
+  status or upgrade available).  The page server-side renders every model
+  card as an <a> link with href="/{publisher}/{slug}".  We fetch the HTML,
+  extract all model URLs, then probe each model's playground page for the
+  server-rendered NVCF function id and namespace.
 
-Known runtime-resolved function ids (not inlined in HTML) are supplied via
-OVERRIDES below — verified by actually calling the playground (BoxPwnr does
-this for moonshotai/kimi-k2.6).
+  Only models whose playground page contains a valid UUID-shaped
+  "nvcfFunctionId" are reported as ok=true -- those are the ones that can
+  be called via the anonymous (hCaptcha-gated) predict endpoint.
 
-Output (stdout): a JSON object with _meta and a sorted `models` array.
-Output (stderr): summary + skipped list.
+Output (stdout): JSON with _meta and sorted `models` + `skipped` arrays.
+Output (stderr): summary counts.
 """
 import json
 import re
 import sys
 import urllib.request
 import concurrent.futures as cf
+import time
 
-V1 = "https://integrate.api.nvidia.com/v1/models"
-PAGE = "https://build.nvidia.com/{m}/playground"
+MODELS_PAGE = "https://build.nvidia.com/models?pageSize=200&filters=nimType%3Anim_type_preview%2CnimType%3Anim_type_upgrade_available"
+PLAYGROUND = "https://build.nvidia.com/{publisher}/{slug}/playground"
 
-# A few playground pages render nvcfFunctionId as "None" because the function
-# id is resolved at runtime rather than inlined in the SSR HTML. We do NOT pin
-# third-party values for them: an earlier attempt used a kimi function id from
-# a third-party doc and the upstream rejected it ("Cannot parse function_id
-# with value None"), proving static pinning only pretends to work. Those models
-# stay skipped until their runtime ids are captured by actually driving the
-# playground page (chromedp + a real hCaptcha flow). OVERRIDES is intentionally
-# empty; documented here so the next contributor knows the policy.
-OVERRIDES = {}
-
-FNID_RE = re.compile(r'"nvcfFunctionId\\?":\\?"([^"\\]{1,40})\\?"')
-NS_RE = re.compile(r'"namespace\\?":\\?"([0-9a-z]+)\\?"')
+FNID_RE = re.compile(r'"nvcfFunctionId\\?":\\?"([a-f0-9-]{36})\\"?')
+NS_RE = re.compile(r'"namespace\\?":\\?"([0-9a-z]+)\\"?')
 
 
-def fetch(url, timeout=25, tries=2):
+def fetch(url, timeout=25, tries=3):
     last = None
     for _ in range(tries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.read().decode("utf-8", "replace")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             last = e
-    raise last
+            time.sleep(1)
+    raise last  # noqa: BLE001
 
 
-def probe(model):
+def get_models_from_page():
+    """Fetch the Models page and return a dict {slug: publisher} for every
+    model card rendered.  Filters out non-model paths (/models/*, /explore/*,
+    etc.)."""
+    html = fetch(MODELS_PAGE)
+    models = {}  # slug -> publisher
+    # Find all <a href="/publisher/slug"> links that are model cards
+    for m in re.finditer(r'href="/([a-zA-Z0-9_.-]+)/([a-zA-Z0-9_.-]+)"', html):
+        pub = m.group(1)
+        slug = m.group(2)
+        # Filter out non-model paths
+        if pub in ("models", "explore", "blueprints", "skills", "_next", ""):
+            continue
+        if slug in ("playground", "", "community"):
+            continue
+        models[slug] = pub
+    return models
+
+
+def probe_playground(publisher, slug):
+    """Fetch the playground page and extract nvcfFunctionId + namespace."""
     try:
-        html = fetch(PAGE.format(m=model))
-    except Exception as e:  # noqa: BLE001
-        return {"model": model, "ok": False, "reason": str(e)}
-    fn = FNID_RE.search(html)
+        html = fetch(PLAYGROUND.format(publisher=publisher, slug=slug), timeout=15)
+    except Exception as e:
+        return {"ok": False, "reason": str(e)}
+
+    fn_m = FNID_RE.search(html)
     ns_m = NS_RE.search(html)
-    ns = ns_m.group(1) if ns_m else ""
-    slug = model.split("/", 1)[-1]
 
-    if model in OVERRIDES:
-        return {"model": model, "slug": slug, "namespace": ns or "qc69jvmznzxy",
-                "function_id": OVERRIDES[model], "ok": True, "source": "override"}
-
-    if not fn:
-        return {"model": model, "ok": False, "reason": "no nvcfFunctionId key"}
-    val = fn.group(1)
-    if re.fullmatch(r"[0-9a-f-]{36}", val):
-        return {"model": model, "slug": slug, "namespace": ns, "function_id": val,
-                "ok": True, "source": "html"}
-    # val == "None" (or anything non-uuid): playground exists but function id
-    # is runtime-resolved and we have no override for it.
-    return {"model": model, "slug": slug, "namespace": ns, "ok": False,
-            "reason": f"nvcfFunctionId={val!r} (runtime-resolved, no override)"}
+    if fn_m:
+        fid = fn_m.group(1)
+        return {"ok": True, "function_id": fid, "namespace": ns_m.group(1) if ns_m else ""}
+    return {"ok": False, "reason": "no nvcfFunctionId in playground HTML"}
 
 
 def main():
-    raw = fetch(V1)
-    ids = [m["id"] for m in json.loads(raw)["data"]]
-    print(f"# {len(ids)} models from {V1}", file=sys.stderr)
+    sys.stderr.write("# Fetching models page (pageSize=200)...\n")
+    slug_pub = get_models_from_page()
+    sys.stderr.write(f"#   {len(slug_pub)} models found\n")
 
+    # Probe all playground pages concurrently
+    sys.stderr.write("# Probing playground pages for NVCF ids...\n")
     results = []
     with cf.ThreadPoolExecutor(max_workers=12) as ex:
-        for r in ex.map(probe, ids):
-            results.append(r)
+        fut_to_info = {ex.submit(probe_playground, pub, slug): (pub, slug)
+                       for slug, pub in slug_pub.items()}
+
+        for fut in cf.as_completed(fut_to_info):
+            pub, slug = fut_to_info[fut]
+            pdata = fut.result()
+            entry = {
+                "model": f"{pub}/{slug}",
+                "slug": slug,
+                "publisher": pub,
+            }
+            if pdata.get("ok"):
+                entry["namespace"] = pdata["namespace"]
+                entry["function_id"] = pdata["function_id"]
+                entry["ok"] = True
+                entry["source"] = "playground"
+            else:
+                entry["ok"] = False
+                entry["reason"] = pdata.get("reason", "unknown")
+            results.append(entry)
 
     ok = [r for r in results if r.get("ok")]
     bad = [r for r in results if not r.get("ok")]
     ok.sort(key=lambda r: r["model"])
-    nss = sorted({r["namespace"] for r in ok if r.get("namespace")})
-    print(f"# {len(ok)} playground chat models / {len(results)} total", file=sys.stderr)
-    print(f"# namespaces: {nss}", file=sys.stderr)
-    print("# skipped:", file=sys.stderr)
-    for r in bad:
-        print(f"#   {r['model']}: {r.get('reason')}", file=sys.stderr)
+    bad.sort(key=lambda r: r["model"])
+    nss = sorted({r.get("namespace", "") for r in ok if r.get("namespace")})
 
-    print(json.dumps({"_meta": {"count": len(ok), "namespaces": nss}, "models": ok},
-                     indent=2))
+    sys.stderr.write(f"# {len(ok)} playground models / {len(results)} total\n")
+    sys.stderr.write(f"# namespaces: {nss}\n")
+    sys.stderr.write("# skipped (no playground):\n")
+    for r in bad:
+        sys.stderr.write(f"#   {r['model']}: {r.get('reason')}\n")
+
+    print(json.dumps({
+        "_meta": {"count": len(ok), "total": len(results), "namespaces": nss},
+        "models": ok,
+        "skipped": bad,
+    }, indent=2))
 
 
 if __name__ == "__main__":
