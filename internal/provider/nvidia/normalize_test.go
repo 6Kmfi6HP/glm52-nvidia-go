@@ -3,6 +3,8 @@ package nvidia
 import (
 	"encoding/json"
 	"testing"
+
+	"glm52-nvidia/internal/models"
 )
 
 func TestNormalizeRequestBody(t *testing.T) {
@@ -19,16 +21,15 @@ func TestNormalizeRequestBody(t *testing.T) {
 	if opts["continuous_usage_stats"] != false {
 		t.Fatalf("got %#v", opts["continuous_usage_stats"])
 	}
-	kw := raw["chat_template_kwargs"].(map[string]any)
-	if kw["enable_thinking"] != true || kw["clear_thinking"] != false {
-		t.Fatalf("thinking kwargs = %#v", kw)
+	if _, ok := raw["chat_template_kwargs"]; ok {
+		t.Fatalf("thinking kwargs should not be injected without a supported model: %#v", raw)
 	}
 }
 
 func TestNormalizeRequestBodyEmptyOrNullKwargs(t *testing.T) {
 	cases := []string{
-		`{"stream":false,"chat_template_kwargs":{}}`,
-		`{"stream":false,"chat_template_kwargs":null}`,
+		`{"model":"qwen/qwen3-next-80b-a3b-instruct","stream":false,"chat_template_kwargs":{}}`,
+		`{"model":"qwen/qwen3-next-80b-a3b-instruct","stream":false,"chat_template_kwargs":null}`,
 	}
 	for _, in := range cases {
 		out, err := NormalizeRequestBody([]byte(in))
@@ -39,15 +40,14 @@ func TestNormalizeRequestBodyEmptyOrNullKwargs(t *testing.T) {
 		if err := json.Unmarshal(out, &raw); err != nil {
 			t.Fatal(err)
 		}
-		kw := raw["chat_template_kwargs"].(map[string]any)
-		if kw["enable_thinking"] != true || kw["clear_thinking"] != false {
+		if kw, ok := raw["chat_template_kwargs"].(map[string]any); ok && len(kw) != 0 {
 			t.Fatalf("in=%s thinking kwargs = %#v", in, kw)
 		}
 	}
 }
 
 func TestNormalizeRequestBodyPreservesThinking(t *testing.T) {
-	in := []byte(`{"stream":false,"chat_template_kwargs":{"enable_thinking":false}}`)
+	in := []byte(`{"model":"qwen/qwen3.5-397b-a17b","stream":false,"chat_template_kwargs":{"enable_thinking":false}}`)
 	out, err := NormalizeRequestBody(in)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestNormalizeThinkingKwargsAliases(t *testing.T) {
 	}{
 		{
 			name: "zai thinking enabled",
-			in:   `{"stream":false,"thinking":{"type":"enabled","clear_thinking":false}}`,
+			in:   `{"model":"z-ai/glm-5.2","stream":false,"thinking":{"type":"enabled","clear_thinking":false}}`,
 			want: map[string]any{
 				"enable_thinking": true,
 				"clear_thinking":  false,
@@ -80,7 +80,7 @@ func TestNormalizeThinkingKwargsAliases(t *testing.T) {
 		},
 		{
 			name: "zai thinking disabled",
-			in:   `{"stream":false,"thinking":{"type":"disabled"}}`,
+			in:   `{"model":"z-ai/glm-5.2","stream":false,"thinking":{"type":"disabled"}}`,
 			want: map[string]any{
 				"enable_thinking": false,
 			},
@@ -88,7 +88,7 @@ func TestNormalizeThinkingKwargsAliases(t *testing.T) {
 		},
 		{
 			name: "top-level enable_thinking false",
-			in:   `{"stream":false,"enable_thinking":false}`,
+			in:   `{"model":"qwen/qwen3.5-397b-a17b","stream":false,"enable_thinking":false}`,
 			want: map[string]any{
 				"enable_thinking": false,
 			},
@@ -96,21 +96,28 @@ func TestNormalizeThinkingKwargsAliases(t *testing.T) {
 		},
 		{
 			name: "top-level enable_thinking true + effort",
-			in:   `{"stream":false,"enable_thinking":true,"reasoning_effort":"high"}`,
+			in:   `{"model":"z-ai/glm-5.2","stream":false,"enable_thinking":true,"reasoning_effort":"high"}`,
 			want: map[string]any{
 				"enable_thinking":  true,
-				"clear_thinking":   false,
 				"reasoning_effort": "high",
 			},
 			stripped: []string{"enable_thinking", "reasoning_effort"},
 		},
 		{
 			name: "kwargs wins over aliases",
-			in:   `{"stream":false,"chat_template_kwargs":{"enable_thinking":false},"thinking":{"type":"enabled"},"enable_thinking":true}`,
+			in:   `{"model":"qwen/qwen3.5-397b-a17b","stream":false,"chat_template_kwargs":{"enable_thinking":false},"thinking":{"type":"enabled"},"enable_thinking":true}`,
 			want: map[string]any{
 				"enable_thinking": false,
 			},
 			stripped: []string{"thinking", "enable_thinking"},
+		},
+		{
+			name: "disabled thinking removes conflicting effort",
+			in:   `{"model":"z-ai/glm-5.2","stream":false,"chat_template_kwargs":{"enable_thinking":false},"reasoning_effort":"high"}`,
+			want: map[string]any{
+				"enable_thinking": false,
+			},
+			stripped: []string{"reasoning_effort"},
 		},
 	}
 	for _, tc := range cases {
@@ -138,5 +145,75 @@ func TestNormalizeThinkingKwargsAliases(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestNormalizeRequestBodyMapsReasoningEffortByModel(t *testing.T) {
+	cases := []struct {
+		name  string
+		model string
+		in    string
+		key   string
+		want  any
+	}{
+		{name: "deepseek low rounds up to high", model: "deepseek-ai/deepseek-v4-pro", in: "low", key: "reasoning_effort", want: "high"},
+		{name: "deepseek medium rounds up to high", model: "deepseek-ai/deepseek-v4-flash", in: "medium", key: "reasoning_effort", want: "high"},
+		{name: "deepseek xhigh rounds up to max", model: "deepseek-ai/deepseek-v4-pro", in: "xhigh", key: "reasoning_effort", want: "max"},
+		{name: "gpt oss max caps at high", model: "openai/gpt-oss-120b", in: "max", key: "reasoning_effort", want: "high"},
+		{name: "mistral low rounds up to high", model: "mistralai/mistral-medium-3.5-128b", in: "low", key: "reasoning_effort", want: "high"},
+		{name: "nemotron super medium rounds up to high", model: "nvidia/nemotron-3-super-120b-a12b", in: "medium", key: "reasoning_effort", want: "high"},
+		{name: "nemotron ultra low rounds up to medium", model: "nvidia/nemotron-3-ultra-550b-a55b", in: "low", key: "reasoning_effort", want: "medium"},
+		{name: "qwen none disables thinking", model: "qwen/qwen3.5-397b-a17b", in: "none", key: "enable_thinking", want: false},
+		{name: "qwen high enables thinking", model: "qwen/qwen3.5-397b-a17b", in: "high", key: "enable_thinking", want: true},
+		{name: "minimax medium uses adaptive thinking", model: "minimaxai/minimax-m3", in: "medium", key: "thinking_mode", want: "adaptive"},
+		{name: "minimax xhigh enables thinking", model: "minimaxai/minimax-m3", in: "xhigh", key: "thinking_mode", want: "enabled"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"model":"` + tc.model + `","reasoning_effort":"` + tc.in + `","stream":false}`)
+			out, err := NormalizeRequestBody(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var raw map[string]any
+			if err := json.Unmarshal(out, &raw); err != nil {
+				t.Fatal(err)
+			}
+			kw, ok := raw["chat_template_kwargs"].(map[string]any)
+			if !ok {
+				t.Fatalf("chat_template_kwargs missing from %s", out)
+			}
+			if got := kw[tc.key]; got != tc.want {
+				t.Fatalf("%s=%#v want %#v (body=%s)", tc.key, got, tc.want, out)
+			}
+			if _, ok := raw["reasoning_effort"]; ok {
+				t.Fatalf("reasoning_effort alias was not consumed: %s", out)
+			}
+		})
+	}
+}
+
+func TestNormalizeRequestBodyDoesNotInjectThinkingIntoUnsupportedModel(t *testing.T) {
+	out, err := NormalizeRequestBody([]byte(`{"model":"qwen/qwen3-next-80b-a3b-instruct","messages":[],"stream":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(out, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["chat_template_kwargs"]; ok {
+		t.Fatalf("unsupported model received thinking kwargs: %s", out)
+	}
+}
+
+func TestReasoningProfilesReferenceRegisteredModels(t *testing.T) {
+	for model := range reasoningProfiles {
+		if _, err := models.Lookup(model); err != nil {
+			t.Errorf("reasoning profile references unsupported model %q: %v", model, err)
+		}
 	}
 }
