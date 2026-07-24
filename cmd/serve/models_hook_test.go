@@ -53,3 +53,18 @@ func TestBindNvidiaRuntimeRegistersExecutor(t *testing.T) {
 		cliproxy.GlobalModelRegistry().UnregisterClient("nvidia-test")
 	})
 }
+
+func TestBindNvidiaRuntimePrimesModelsBeforeAuthLoad(t *testing.T) {
+	models := nvidia.RegistryModels()
+	reg := cliproxy.GlobalModelRegistry()
+	reg.UnregisterClient(nvidiaAuthFileName)
+	t.Cleanup(func() { reg.UnregisterClient(nvidiaAuthFileName) })
+
+	core := coreauth.NewManager(nil, nil, nil)
+	bindNvidiaRuntime(core, nvidia.NewExecutor(nvidia.Options{}), models)
+
+	got := reg.GetAvailableModelsByProvider(nvidiaProvider)
+	if len(got) == 0 {
+		t.Fatal("models unavailable before auth load")
+	}
+}

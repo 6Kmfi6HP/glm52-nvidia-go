@@ -29,6 +29,9 @@ func bindNvidiaRuntime(core *coreauth.Manager, exec coreauth.ProviderExecutor, m
 		core.RefreshSchedulerEntry(a.ID)
 		n++
 	}
+	if n == 0 {
+		cliproxy.GlobalModelRegistry().RegisterClient(nvidiaAuthFileName, nvidiaProvider, models)
+	}
 	return n
 }
 

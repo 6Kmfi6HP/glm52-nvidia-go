@@ -163,6 +163,7 @@ func main() {
 	// Watcher replaces unknown providers with OpenAICompatExecutor and clears
 	// models via UnregisterClient; hooks + reconciler put ours back.
 	cliproxy.SetGlobalModelRegistryHook(&nvidiaModelHook{core: core, exec: exec, models: models})
+	bindNvidiaRuntime(core, exec, models)
 
 	hooks := cliproxy.Hooks{
 		OnAfterStart: func(_ *cliproxy.Service) {
