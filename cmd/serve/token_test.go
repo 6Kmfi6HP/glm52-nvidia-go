@@ -11,36 +11,65 @@ import (
 	"testing"
 )
 
-func TestIsInvalidCaptchaToken(t *testing.T) {
+func TestIsRetryableCaptchaFailure(t *testing.T) {
 	cases := []struct {
-		name string
-		body string
-		want bool
+		name   string
+		status int
+		body   string
+		want   bool
 	}{
 		{
-			name: "nvidia invalid",
-			body: `{"requestStatus":{"statusCode":"INVALID_REQUEST","statusDescription":"Token is invalid","requestId":"abc"}}`,
-			want: true,
+			name:   "nvidia invalid token",
+			status: http.StatusBadRequest,
+			body:   `{"requestStatus":{"statusCode":"INVALID_REQUEST","statusDescription":"Token is invalid","requestId":"abc"}}`,
+			want:   true,
 		},
 		{
-			name: "case insensitive",
-			body: `{"requestStatus":{"statusDescription":"token is Invalid"}}`,
-			want: true,
+			name:   "case insensitive token",
+			status: http.StatusBadRequest,
+			body:   `{"requestStatus":{"statusDescription":"token is Invalid"}}`,
+			want:   true,
 		},
 		{
-			name: "other error",
-			body: `{"requestStatus":{"statusCode":"INVALID_REQUEST","statusDescription":"bad prompt"}}`,
-			want: false,
+			name:   "generic captcha body",
+			status: http.StatusForbidden,
+			body:   `{"error":"hcaptcha rejected the token"}`,
+			want:   true,
 		},
 		{
-			name: "empty",
-			body: ``,
-			want: false,
+			name:   "missing captcha wording",
+			status: http.StatusBadRequest,
+			body:   `{"error":"missing-captcha"}`,
+			want:   true,
+		},
+		{
+			name:   "unrelated client error",
+			status: http.StatusBadRequest,
+			body:   `{"requestStatus":{"statusCode":"INVALID_REQUEST","statusDescription":"bad prompt"}}`,
+			want:   false,
+		},
+		{
+			name:   "empty body client error",
+			status: http.StatusBadRequest,
+			body:   ``,
+			want:   false,
+		},
+		{
+			name:   "5xx not retryable as captcha",
+			status: http.StatusBadGateway,
+			body:   `{"error":"hcaptcha is down"}`,
+			want:   false,
+		},
+		{
+			name:   "2xx never retryable",
+			status: http.StatusOK,
+			body:   `{"error":"hcaptcha"}`,
+			want:   false,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isInvalidCaptchaToken([]byte(tc.body)); got != tc.want {
+			if got := isRetryableCaptchaFailure(tc.status, []byte(tc.body)); got != tc.want {
 				t.Fatalf("got %v want %v", got, tc.want)
 			}
 		})
@@ -70,28 +99,31 @@ func TestUpstreamRetryOnInvalidToken(t *testing.T) {
 
 	tokens := []string{"bad", "good"}
 	var upResp *http.Response
-	var err error
 	for i, tok := range tokens {
 		req, _ := http.NewRequest(http.MethodPost, up.URL, bytes.NewReader(body))
 		req.Header.Set("nv-captcha-token", tok)
-		upResp, err = client.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if upResp.StatusCode >= 400 {
-			raw, _ := io.ReadAll(upResp.Body)
-			_ = upResp.Body.Close()
-			if isInvalidCaptchaToken(raw) && i+1 < len(tokens) {
+		if resp.StatusCode >= 400 {
+			raw, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if isRetryableCaptchaFailure(resp.StatusCode, raw) && i+1 < len(tokens) {
 				continue
 			}
 			t.Fatalf("unexpected error body=%s", raw)
 		}
+		upResp = resp
 		break
 	}
-	defer upResp.Body.Close()
+	if upResp == nil {
+		t.Fatal("no successful upstream response")
+	}
 	if hits != 2 {
 		t.Fatalf("hits=%d want 2", hits)
 	}
+	defer upResp.Body.Close()
 	raw, _ := io.ReadAll(upResp.Body)
 	if !strings.Contains(string(raw), "ok") {
 		t.Fatalf("body=%q", raw)

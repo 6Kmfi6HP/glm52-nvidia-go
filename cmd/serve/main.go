@@ -301,16 +301,17 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		release()
 		release = nil
 
-		if isInvalidCaptchaToken(raw) && attempt < maxAttempts {
-			log.Printf("upstream captcha invalid (attempt %d/%d); fetching a fresh token (captcha=%s upstream_ttfb=%s)",
-				attempt, maxAttempts, captchaWait.Round(time.Millisecond), upstreamTTFB.Round(time.Millisecond))
+		retryable := isRetryableCaptchaFailure(status, raw)
+		if retryable && attempt < maxAttempts {
+			log.Printf("upstream captcha failure status=%d (attempt %d/%d); fetching a fresh token (captcha=%s upstream_ttfb=%s)",
+				status, attempt, maxAttempts, captchaWait.Round(time.Millisecond), upstreamTTFB.Round(time.Millisecond))
 			continue
 		}
 
-		if isInvalidCaptchaToken(raw) {
-			log.Printf("timing captcha=%s inflight=%s upstream_ttfb=%s status=401 ready=%d captcha_invalid",
+		if retryable {
+			log.Printf("timing captcha=%s inflight=%s upstream_ttfb=%s status=%d ready=%d captcha_invalid",
 				captchaWait.Round(time.Millisecond), inflightWait.Round(time.Millisecond),
-				upstreamTTFB.Round(time.Millisecond), s.poolReady())
+				upstreamTTFB.Round(time.Millisecond), status, s.poolReady())
 			httpError(w, http.StatusUnauthorized, "captcha token invalid or expired; retry the request")
 			return
 		}
@@ -431,9 +432,25 @@ func (s *server) acquireInflight(ctx context.Context) (release func(), err error
 	}
 }
 
-// isInvalidCaptchaToken detects NVIDIA's "Token is invalid" captcha failures.
-func isInvalidCaptchaToken(raw []byte) bool {
+// isRetryableCaptchaFailure reports whether an upstream 4xx is a captcha /
+// hCaptcha token failure fixed by fetching a fresh token and retrying.
+//
+// Mirrors BoxPwnr's NimClient._is_retryable_failure for the web-playground
+// surface: any 4xx whose body mentions the captcha widget, plus NVIDIA's
+// "Token is invalid" wording. A 5xx upstream is NOT retried here (that path
+// belongs to the transport / pool layer; recycling a token won't help), and a
+// 4xx with an unrelated error body is a real client error — retrying would
+// burn the one-shot token for nothing and may waste budget.
+//
+// status is the upstream HTTP status (always ≥400 at the call site).
+func isRetryableCaptchaFailure(status int, raw []byte) bool {
+	if status < 400 || status >= 500 {
+		// Only client errors are captcha-shaped. 5xx is upstream, 2xx/3xx is success.
+		return false
+	}
 	if len(raw) == 0 {
+		// A 4xx with an empty body gives nothing to match — treat as a real
+		// client error rather than churning tokens on an unknown failure.
 		return false
 	}
 	var er glm52.ErrorResponse
@@ -447,7 +464,14 @@ func isInvalidCaptchaToken(raw []byte) bool {
 		}
 	}
 	low := strings.ToLower(string(raw))
-	return strings.Contains(low, "token is invalid")
+	if strings.Contains(low, "token is invalid") {
+		return true
+	}
+	// Generic hCaptcha failures surfaced by the playground risk engine
+	// (missing-captcha, captcha rejected, sitekey mismatch, …). BoxPwnr keys
+	// these off the body, since NVIDIA's structured statusDescription is not
+	// guaranteed for the widget-less error path.
+	return strings.Contains(low, "captcha") || strings.Contains(low, "hcaptcha")
 }
 
 // pipeSSE copies upstream bytes to the client, flushing after each write so
