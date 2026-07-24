@@ -14,6 +14,12 @@ on:
 permissions:
   contents: write
   packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -22,6 +28,7 @@ jobs:
   binaries:
     name: Build binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -80,6 +87,7 @@ jobs:
     name: GitHub Release
     needs: binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,6 +107,11 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+
       - name: Create release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -116,6 +129,7 @@ jobs:
   image:
     name: Publish container image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -129,7 +143,6 @@ jobs:
           else
             echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
-          # GHCR requires lowercase image names
           echo "image=${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3

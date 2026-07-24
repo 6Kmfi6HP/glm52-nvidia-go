@@ -1,0 +1,44 @@
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - gocritic
+    - gofmt
+    - goimports
+    - nilerr
+    - noctx
+    - prealloc
+    - unconvert
+    - unparam
+    - misspell
+    - tenv
+    - tparallel
+    - usestdlibvars
+    - errorlint
+    - copyloopvar
+  disable-all: true
+
+linters-settings:
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - performance
+      - style
+  misspell:
+    locale: US
+  errcheck:
+    check-blank: true
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-use-default: false
+
+run:
+  timeout: 5m
+  go: "1.26"
