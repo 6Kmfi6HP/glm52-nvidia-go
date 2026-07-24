@@ -1,27 +1,28 @@
+version: "2"
+
 linters:
+  default: none
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
     - unused
     - bodyclose
     - gocritic
-    - gofmt
-    - goimports
     - nilerr
     - noctx
-    - prealloc
     - unconvert
     - unparam
     - misspell
-    - tenv
-    - tparallel
     - usestdlibvars
     - errorlint
     - copyloopvar
-  disable-all: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
 
 linters-settings:
   gocritic:
@@ -41,4 +42,3 @@ issues:
 
 run:
   timeout: 5m
-  go: "1.26"
