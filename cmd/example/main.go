@@ -97,8 +97,7 @@ func main() {
 		}
 		fmt.Println()
 		if lastUsage != nil {
-			fmt.Printf("\n[Usage: %d prompt + %d completion = %d total]\n",
-				lastUsage.PromptTokens, lastUsage.CompletionTokens, lastUsage.TotalTokens)
+			fmt.Printf("\n[Usage: %s]\n", lastUsage.Format())
 		}
 	} else {
 		resp, err := client.Chat(ctx, messages)
@@ -114,8 +113,7 @@ func main() {
 			fmt.Println(msg.Content)
 		}
 		if resp.Usage != nil {
-			fmt.Printf("\n[Usage: %d prompt + %d completion = %d total]\n",
-				resp.Usage.PromptTokens, resp.Usage.CompletionTokens, resp.Usage.TotalTokens)
+			fmt.Printf("\n[Usage: %s]\n", resp.Usage.Format())
 		}
 	}
 }

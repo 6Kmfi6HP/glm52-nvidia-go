@@ -14,7 +14,12 @@
 //	    func(chunk ChatChunk) { fmt.Print(chunk.Content) })
 package glm52
 
-import "time"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+)
 
 // --- types ---
 
@@ -28,6 +33,7 @@ const (
 
 // Message represents a single chat message.
 // When Thinking is enabled, assistant deltas/messages may include ReasoningContent.
+// Upstream may send JSON null for Content or ReasoningContent; that unmarshals to "".
 type Message struct {
 	Role             string `json:"role,omitempty"`
 	Content          string `json:"content,omitempty"`
@@ -56,6 +62,7 @@ type StreamOptions struct {
 }
 
 // ChatResponse is the non-streaming response (also used as final assembled result).
+// Field set matches NVIDIA playground predict (OpenAI chat.completion shape).
 type ChatResponse struct {
 	ID                string   `json:"id"`
 	Object            string   `json:"object"`
@@ -64,6 +71,7 @@ type ChatResponse struct {
 	Choices           []Choice `json:"choices"`
 	Usage             *Usage   `json:"usage,omitempty"`
 	SystemFingerprint string   `json:"system_fingerprint,omitempty"`
+	ServiceTier       string   `json:"service_tier,omitempty"`
 }
 
 // Choice is a single completion choice.
@@ -71,16 +79,53 @@ type Choice struct {
 	Index        int     `json:"index"`
 	Message      Message `json:"message"`
 	FinishReason string  `json:"finish_reason"`
+	// Logprobs is opaque; upstream currently returns null.
+	Logprobs any `json:"logprobs,omitempty"`
 }
 
-// Usage contains token usage stats.
+// PromptTokensDetails is nested under usage when the backend reports prompt breakdowns.
+// Observed on cache hits: {"audio_tokens":null,"cached_tokens":N}.
+type PromptTokensDetails struct {
+	CachedTokens *int `json:"cached_tokens"`
+	AudioTokens  *int `json:"audio_tokens"`
+}
+
+// Usage contains token usage stats from upstream predict responses.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens        int                  `json:"prompt_tokens"`
+	CompletionTokens    int                  `json:"completion_tokens"`
+	TotalTokens         int                  `json:"total_tokens"`
+	PromptTokensDetails *PromptTokensDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+// CachedTokens returns prompt cache hit count when prompt_tokens_details.cached_tokens is set.
+func (u *Usage) CachedTokens() int {
+	if u == nil || u.PromptTokensDetails == nil || u.PromptTokensDetails.CachedTokens == nil {
+		return 0
+	}
+	return *u.PromptTokensDetails.CachedTokens
+}
+
+// Format returns a compact human-readable usage line for CLI display.
+func (u *Usage) Format() string {
+	if u == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d prompt + %d completion = %d total",
+		u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+	if c := u.CachedTokens(); c > 0 {
+		b.WriteString(" (cached ")
+		b.WriteString(strconv.Itoa(c))
+		b.WriteByte(')')
+	} else if u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens != nil {
+		b.WriteString(" (cached 0)")
+	}
+	return b.String()
 }
 
 // ChatChunk is a single SSE data chunk (streaming).
+// Object is typically "chat.completion.chunk". Final usage-only chunks may have empty Choices.
 type ChatChunk struct {
 	ID                string        `json:"id"`
 	Object            string        `json:"object"`
@@ -89,6 +134,7 @@ type ChatChunk struct {
 	Choices           []ChunkChoice `json:"choices"`
 	Usage             *Usage        `json:"usage,omitempty"`
 	SystemFingerprint string        `json:"system_fingerprint,omitempty"`
+	ServiceTier       string        `json:"service_tier,omitempty"`
 }
 
 // ChunkChoice is a delta choice for streaming.
@@ -96,6 +142,8 @@ type ChunkChoice struct {
 	Index        int     `json:"index"`
 	Delta        Message `json:"delta"`
 	FinishReason string  `json:"finish_reason"`
+	// Logprobs is opaque; upstream currently returns null.
+	Logprobs any `json:"logprobs,omitempty"`
 }
 
 // ErrorResponse represents an API error.
