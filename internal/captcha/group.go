@@ -59,7 +59,11 @@ func (g *BrowserGroup) Len() int {
 }
 
 // Extract borrows a free browser, mints one token, then returns it to the pool.
-// Hard failures recycle the Chrome process once before giving up.
+// Recovery is layered, mirroring BoxPwnr NimClient's reload→relaunch ladders:
+// a hard failure first gets one cheap in-place retry on the *same* browser
+// (the "reload" rung — a cold-start missing-captcha often clears on a second
+// execute), and only a second hard failure recycles the whole Chrome process
+// (the "relaunch" rung — clears a wedged renderer / stale session).
 func (g *BrowserGroup) Extract(ctx context.Context) (string, error) {
 	g.mu.Lock()
 	closed := g.closed
@@ -83,7 +87,22 @@ func (g *BrowserGroup) Extract(ctx context.Context) (string, error) {
 			g.release(b)
 			return "", err
 		}
-		log.Printf("captcha browser hard failure; recycling chrome: %v", err)
+		// "reload" rung: one cheap retry on the same browser before recycling.
+		// Cold-start `missing-captcha` (the dominant transient hard failure on
+		// freshly-launched Chromium) clears on a second execute; recycling
+		// immediately would pay the ~1–2s Chrome relaunch for a transient blip.
+		log.Printf("captcha browser hard failure; retrying on same chrome: %v", err)
+		tok, err = b.Extract(ctx)
+		if err == nil {
+			g.release(b)
+			return tok, nil
+		}
+		if ctx.Err() != nil || !isHardExtractFailure(err) {
+			g.release(b)
+			return "", err
+		}
+		// "relaunch" rung: twice-bitten renderer / stale session — rebuild.
+		log.Printf("captcha browser hard failure again; recycling chrome: %v", err)
 		nb, rerr := g.recycle(b)
 		if rerr != nil {
 			// old browser already closed inside recycle on success only;
