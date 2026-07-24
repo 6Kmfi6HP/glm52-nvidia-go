@@ -34,11 +34,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
 
 	_ "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator/builtin"
 )
@@ -153,26 +151,26 @@ func main() {
 	if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
 		dirSetter.SetBaseDir(cfg.AuthDir)
 	}
-	core := coreauth.NewManager(tokenStore, nil, nil)
+
+	models := nvidia.RegistryModels()
+	authHook := &nvidiaAuthHook{exec: exec, models: models}
+	core := coreauth.NewManager(tokenStore, nil, authHook)
+	authHook.core = core
 	core.RegisterExecutor(exec)
-	if _, err := core.Register(coreauth.WithSkipPersist(ctx), &coreauth.Auth{
-		ID:       "nvidia-local",
-		Provider: "nvidia",
-		Status:   coreauth.StatusActive,
-	}); err != nil {
-		log.Fatalf("register auth: %v", err)
-	}
+	// Do NOT Register auth before Run: coreManager.Load() resets from AuthDir.
+	// Auth file is written in buildConfig so Load() picks up provider=nvidia.
+
+	// Watcher replaces unknown providers with OpenAICompatExecutor and clears
+	// models via UnregisterClient; hooks + reconciler put ours back.
+	cliproxy.SetGlobalModelRegistryHook(&nvidiaModelHook{core: core, exec: exec, models: models})
 
 	hooks := cliproxy.Hooks{
 		OnAfterStart: func(_ *cliproxy.Service) {
-			models := nvidia.RegistryModels()
-			for _, a := range core.List() {
-				if strings.EqualFold(a.Provider, "nvidia") {
-					cliproxy.GlobalModelRegistry().RegisterClient(a.ID, "nvidia", models)
-				}
-			}
-			log.Printf("serve %s listening on http://localhost%s (chat/completions + responses + messages; coalesce=%s max-inflight=%d)",
-				version, *addr, execCoalesce(*coalesceMs), *maxInflight)
+			ensureNvidiaAuth(core)
+			n := bindNvidiaRuntime(core, exec, models)
+			startNvidiaReconciler(ctx, core, exec, models)
+			log.Printf("serve %s listening on http://localhost%s (models=%d auth=%d; chat/completions + responses + messages; coalesce=%s max-inflight=%d)",
+				version, *addr, len(models), n, execCoalesce(*coalesceMs), *maxInflight)
 		},
 	}
 
@@ -181,20 +179,35 @@ func main() {
 		WithConfigPath(cfgPath).
 		WithCoreAuthManager(core).
 		WithServerOptions(
-			api.WithRouterConfigurator(func(engine *gin.Engine, _ *handlers.BaseAPIHandler, _ *config.Config) {
-				engine.GET("/healthz", func(c *gin.Context) {
-					out := gin.H{"ok": true}
-					if p := exec.Pool(); p != nil {
-						fills, takes, errs, expired := p.Stats()
-						out["pool"] = gin.H{
-							"ready":   p.Ready(),
-							"fills":   fills,
-							"takes":   takes,
-							"errors":  errs,
-							"expired": expired,
-						}
+			// CLIProxyAPI already registers GET/HEAD /healthz; re-registering panics.
+			// Install middleware before routes so we can enrich the response with pool stats.
+			api.WithEngineConfigurator(func(engine *gin.Engine) {
+				engine.Use(func(c *gin.Context) {
+					if c.Request.URL.Path != "/healthz" {
+						c.Next()
+						return
 					}
-					c.JSON(http.StatusOK, out)
+					switch c.Request.Method {
+					case http.MethodHead:
+						c.Status(http.StatusOK)
+						c.Abort()
+					case http.MethodGet:
+						out := gin.H{"ok": true}
+						if p := exec.Pool(); p != nil {
+							fills, takes, errs, expired := p.Stats()
+							out["pool"] = gin.H{
+								"ready":   p.Ready(),
+								"fills":   fills,
+								"takes":   takes,
+								"errors":  errs,
+								"expired": expired,
+							}
+						}
+						c.JSON(http.StatusOK, out)
+						c.Abort()
+					default:
+						c.Next()
+					}
 				})
 			}),
 		).

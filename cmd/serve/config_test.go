@@ -2,6 +2,8 @@ package main
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -46,5 +48,13 @@ func TestBuildConfigEmptyAPIKeys(t *testing.T) {
 	}
 	if !cfg.RemoteManagement.DisableControlPanel {
 		t.Fatal("expected control panel disabled")
+	}
+	authPath := filepath.Join(cfg.AuthDir, nvidiaAuthFileName)
+	raw, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("nvidia auth file: %v", err)
+	}
+	if !strings.Contains(string(raw), `"type":"nvidia"`) {
+		t.Fatalf("auth file contents=%q", raw)
 	}
 }
