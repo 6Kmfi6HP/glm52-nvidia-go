@@ -1,10 +1,8 @@
-package main
+package nvidia
 
 import (
 	"encoding/json"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -77,15 +75,16 @@ func TestCoalesceSSEMergesWindow(t *testing.T) {
 		``,
 	}, "\n")
 
-	rec := httptest.NewRecorder()
-	if err := coalesceSSE(rec, strings.NewReader(upstream), 50*time.Millisecond); err != nil {
+	var events []string
+	if err := coalesceSSEEvents(strings.NewReader(upstream), 50*time.Millisecond, func(line string) error {
+		events = append(events, strings.TrimPrefix(line, "data: "))
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 
-	body := rec.Body.String()
-	events := parseDataEvents(body)
 	if len(events) < 2 {
-		t.Fatalf("expected coalesced content + DONE, got %d events: %q", len(events), body)
+		t.Fatalf("expected coalesced content + DONE, got %d events: %#v", len(events), events)
 	}
 	if events[len(events)-1] != "[DONE]" {
 		t.Fatalf("last event want [DONE], got %q", events[len(events)-1])
@@ -102,13 +101,11 @@ func TestCoalesceSSEMergesWindow(t *testing.T) {
 		content.WriteString(delta["content"].(string))
 	}
 	if content.String() != "ABC" {
-		t.Fatalf("content=%q events=%d body=%q", content.String(), len(events)-1, body)
+		t.Fatalf("content=%q events=%d", content.String(), len(events)-1)
 	}
-	// First content flushes immediately (TTFT); later deltas may coalesce.
 	if len(events)-1 < 1 || len(events)-1 > 3 {
-		t.Fatalf("want 1-3 content events after eager-first flush, got %d body=%q", len(events)-1, body)
+		t.Fatalf("want 1-3 content events after eager-first flush, got %d", len(events)-1)
 	}
-	// First event should be just "A" (eager flush).
 	var first map[string]any
 	if err := json.Unmarshal([]byte(events[0]), &first); err != nil {
 		t.Fatal(err)
@@ -121,39 +118,20 @@ func TestCoalesceSSEMergesWindow(t *testing.T) {
 
 func TestCoalesceSSEPassthroughWhenOff(t *testing.T) {
 	upstream := "data: {\"choices\":[{\"delta\":{\"content\":\"Z\"}}]}\n\ndata: [DONE]\n\n"
-	rec := httptest.NewRecorder()
-	if err := coalesceSSE(rec, strings.NewReader(upstream), 0); err != nil {
+	var body strings.Builder
+	if err := coalesceSSEEvents(strings.NewReader(upstream), 0, func(line string) error {
+		body.WriteString(line)
+		body.WriteString("\n")
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(rec.Body.String(), "Z") {
-		t.Fatalf("passthrough body=%q", rec.Body.String())
+	if !strings.Contains(body.String(), "Z") {
+		t.Fatalf("passthrough body=%q", body.String())
 	}
 }
 
-// failAfterNWriter fails writes after n successful Write calls so coalesceSSE
-// returns early while the upstream reader may still be producing lines.
-type failAfterNWriter struct {
-	http.ResponseWriter
-	n, writes int
-}
-
-func (w *failAfterNWriter) Write(p []byte) (int, error) {
-	w.writes++
-	if w.writes > w.n {
-		return 0, errWriteFailed
-	}
-	return w.ResponseWriter.Write(p)
-}
-
-func (w *failAfterNWriter) Flush() {
-	if f, ok := w.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-var errWriteFailed = errors.New("write failed")
-
-func TestCoalesceSSEEarlyWriteErrorDoesNotHang(t *testing.T) {
+func TestCoalesceSSEEarlyEmitErrorDoesNotHang(t *testing.T) {
 	var lines []string
 	for i := 0; i < 64; i++ {
 		lines = append(lines,
@@ -162,13 +140,18 @@ func TestCoalesceSSEEarlyWriteErrorDoesNotHang(t *testing.T) {
 		)
 	}
 	upstream := strings.Join(lines, "\n")
+	errWriteFailed := errors.New("write failed")
 
-	rec := httptest.NewRecorder()
-	w := &failAfterNWriter{ResponseWriter: rec, n: 1}
-
+	n := 0
 	done := make(chan error, 1)
 	go func() {
-		done <- coalesceSSE(w, strings.NewReader(upstream), 50*time.Millisecond)
+		done <- coalesceSSEEvents(strings.NewReader(upstream), 50*time.Millisecond, func(line string) error {
+			n++
+			if n > 1 {
+				return errWriteFailed
+			}
+			return nil
+		})
 	}()
 
 	select {
@@ -180,22 +163,6 @@ func TestCoalesceSSEEarlyWriteErrorDoesNotHang(t *testing.T) {
 			t.Fatalf("err=%v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("coalesceSSE hung after write error (reader goroutine leak?)")
+		t.Fatal("coalesceSSEEvents hung after emit error")
 	}
-}
-
-func parseDataEvents(body string) []string {
-	var out []string
-	for _, block := range strings.Split(body, "\n\n") {
-		block = strings.TrimSpace(block)
-		if block == "" {
-			continue
-		}
-		for _, line := range strings.Split(block, "\n") {
-			if strings.HasPrefix(line, "data: ") {
-				out = append(out, strings.TrimPrefix(line, "data: "))
-			}
-		}
-	}
-	return out
 }

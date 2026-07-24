@@ -1,30 +1,18 @@
-package main
+package nvidia
 
 import (
 	"bufio"
 	"encoding/json"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 )
 
-// coalesceSSE reads upstream SSE, merges consecutive content deltas within
-// window, and writes/flushes coalesced events to the client.
-func coalesceSSE(w http.ResponseWriter, src io.Reader, window time.Duration) error {
+// coalesceSSEEvents reads upstream SSE and yields coalesced event lines
+// (without the trailing blank line). When window <= 0, lines are passed through.
+func coalesceSSEEvents(src io.Reader, window time.Duration, emit func(line string) error) error {
 	if window <= 0 {
-		return pipeSSE(w, src)
-	}
-
-	flusher, _ := w.(http.Flusher)
-	writeEvent := func(line string) error {
-		if _, err := io.WriteString(w, line+"\n\n"); err != nil {
-			return err
-		}
-		if flusher != nil {
-			flusher.Flush()
-		}
-		return nil
+		return pipeSSELines(src, emit)
 	}
 
 	type readResult struct {
@@ -80,7 +68,7 @@ func coalesceSSE(w http.ResponseWriter, src io.Reader, window time.Duration) err
 		if err != nil {
 			return err
 		}
-		return writeEvent("data: " + string(raw))
+		return emit("data: " + string(raw))
 	}
 	armTimer := func() {
 		stopTimer()
@@ -116,7 +104,7 @@ func coalesceSSE(w http.ResponseWriter, src io.Reader, window time.Duration) err
 				if err := flushPending(); err != nil {
 					return err
 				}
-				if err := writeEvent(line); err != nil {
+				if err := emit(line); err != nil {
 					return err
 				}
 
@@ -127,7 +115,7 @@ func coalesceSSE(w http.ResponseWriter, src io.Reader, window time.Duration) err
 					if err := flushPending(); err != nil {
 						return err
 					}
-					if err := writeEvent(line); err != nil {
+					if err := emit(line); err != nil {
 						return err
 					}
 					break
@@ -138,7 +126,7 @@ func coalesceSSE(w http.ResponseWriter, src io.Reader, window time.Duration) err
 					if err := flushPending(); err != nil {
 						return err
 					}
-					if err := writeEvent(line); err != nil {
+					if err := emit(line); err != nil {
 						return err
 					}
 					break
@@ -171,7 +159,7 @@ func coalesceSSE(w http.ResponseWriter, src io.Reader, window time.Duration) err
 				if err := flushPending(); err != nil {
 					return err
 				}
-				if err := writeEvent(line); err != nil {
+				if err := emit(line); err != nil {
 					return err
 				}
 			}
@@ -186,6 +174,27 @@ func coalesceSSE(w http.ResponseWriter, src io.Reader, window time.Duration) err
 				}
 				return rr.err
 			}
+		}
+	}
+}
+
+func pipeSSELines(src io.Reader, emit func(line string) error) error {
+	reader := bufio.NewReaderSize(src, 64<<10)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			trimmed := strings.TrimRight(line, "\r\n")
+			if trimmed != "" && !strings.HasPrefix(trimmed, ":") {
+				if errEmit := emit(trimmed); errEmit != nil {
+					return errEmit
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
 		}
 	}
 }
