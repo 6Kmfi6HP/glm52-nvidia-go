@@ -1,6 +1,36 @@
 # GLM-5.2 NVIDIA NIM Go Client
 
-逆向工程 NVIDIA Playground 的 API 调用，实现 Go 语言本地调用 GLM-5.2。
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![GLM-5.2](https://img.shields.io/badge/Model-GLM--5.2-753B-orange)](https://build.nvidia.com/z-ai/glm-5.2/playground)
+[![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI_Compatible-412991?logo=openai&logoColor=white)](#方式-3openai-兼容本地代理)
+[![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?logo=docker&logoColor=white)](#docker-部署方案-achromium--serve)
+[![Status](https://img.shields.io/badge/Status-Reverse_Engineered-yellow)](#逆向分析报告)
+![Platforms](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)
+
+> **English:** A reverse-engineered Go client and OpenAI-compatible reverse proxy for **NVIDIA Playground's [GLM-5.2](https://build.nvidia.com/z-ai/glm-5.2/playground)** LLM (753B MoE, 1M context, thinking/tool-calling/streaming). It automates one-shot **hCaptcha** credentials with headless Chromium (chromedp), runs a prewarmed captcha token pool, exposes an OpenAI Chat Completions endpoint, and ships with Docker deployment and SSE/latency benchmarks.
+
+**中文:** 逆向工程 NVIDIA Playground 的 API 调用，实现 Go 语言本地调用 [GLM-5.2](https://build.nvidia.com/z-ai/glm-5.2/playground)（753B MoE、1M 上下文、思维链/工具调用/流式输出）。通过 headless Chromium（chromedp）自动化 hCaptcha 凭证，维护预热 token 池，对外提供 OpenAI Chat Completions 兼容端点，含 Docker 部署与 SSE/延迟基准。
+
+### 快速开始
+
+```bash
+# 一键启动 OpenAI 兼容代理（内置 Chromium + captcha 预热池）
+go run ./cmd/serve -auto -addr :8080
+
+# 调用（与 OpenAI SDK 兼容）
+curl http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"z-ai/glm-5.2","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+```
+
+或直接跑已发布镜像：
+
+```bash
+docker run --rm -p 8080:8080 --shm-size=2g ghcr.io/6kmfi6hp/glm52-nvidia-go:latest
+```
+
+---
 
 ## 逆向分析报告
 
