@@ -30,12 +30,15 @@ import concurrent.futures as cf
 V1 = "https://integrate.api.nvidia.com/v1/models"
 PAGE = "https://build.nvidia.com/{m}/playground"
 
-# Models whose /playground HTML renders nvcfFunctionId as "None" — the real
-# function id is only discoverable by driving the page at runtime. Verified
-# values go here so the registry can still route them.
-OVERRIDES = {
-    "moonshotai/kimi-k2.6": "23d4f03a-b8a6-4adb-a183-7daa083a09cc",
-}
+# A few playground pages render nvcfFunctionId as "None" because the function
+# id is resolved at runtime rather than inlined in the SSR HTML. We do NOT pin
+# third-party values for them: an earlier attempt used a kimi function id from
+# a third-party doc and the upstream rejected it ("Cannot parse function_id
+# with value None"), proving static pinning only pretends to work. Those models
+# stay skipped until their runtime ids are captured by actually driving the
+# playground page (chromedp + a real hCaptcha flow). OVERRIDES is intentionally
+# empty; documented here so the next contributor knows the policy.
+OVERRIDES = {}
 
 FNID_RE = re.compile(r'"nvcfFunctionId\\?":\\?"([^"\\]{1,40})\\?"')
 NS_RE = re.compile(r'"namespace\\?":\\?"([0-9a-z]+)\\?"')

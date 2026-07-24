@@ -18,7 +18,6 @@ func TestLookupDefault(t *testing.T) {
 func TestLookupKnown(t *testing.T) {
 	cases := map[string]string{
 		"z-ai/glm-5.2":                      "glm-5.2",
-		"moonshotai/kimi-k2.6":              "kimi-k2.6",
 		"deepseek-ai/deepseek-v4-pro":       "deepseek-v4-pro",
 		"nvidia/nemotron-3-ultra-550b-a55b": "nemotron-3-ultra-550b-a55b",
 	}

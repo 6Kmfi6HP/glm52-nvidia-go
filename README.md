@@ -51,7 +51,7 @@ docker run --rm -p 8080:8080 --shm-size=2g ghcr.io/6kmfi6hp/glm52-nvidia-go:late
 
 ### 多模型支持
 
-每个 build.nvidia.com Playground 模型都有独立的 `slug`（端点路径）与 `nv-function-id`，namespace `qc69jvmznzxy` 全模型共享。`internal/models` 持有一份已爬取的注册表（53 个 chat playground 模型，含 `z-ai/glm-5.2`、`moonshotai/kimi-k2.6`、`nvidia/nemotron-*`、`openai/gpt-oss-*`、`qwen/qwen3.5-*` 等）。
+每个 build.nvidia.com Playground 模型都有独立的 `slug`（端点路径）与 `nv-function-id`，namespace `qc69jvmznzxy` 全模型共享。`internal/models` 持有一份已爬取的注册表（52 个 chat playground 模型，含 `z-ai/glm-5.2`、`deepseek-ai/deepseek-v4-pro`、`nvidia/nemotron-*`、`openai/gpt-oss-*`、`qwen/qwen3.5-*` 等，已用真实 captcha token 端到端验证）。
 
 注册表由 `scripts/scrape_playground_models.py` 生成：拉取 `https://integrate.api.nvidia.com/v1/models` 的全量 id 列表，逐个抓 `/{id}/playground` 页面，解析 SSR 内联的 `nvcfFunctionId`+`namespace`。刷新：
 
@@ -65,10 +65,10 @@ python3 scripts/scrape_playground_models.py > scripts/playground_models.json
 ```bash
 curl http://localhost:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"moonshotai/kimi-k2.6","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+  -d '{"model":"deepseek-ai/deepseek-v4-pro","messages":[{"role":"user","content":"Hi"}],"stream":true}'
 ```
 
-未纳入的模型（如 `ibm/granite-*-code-instruct`、`nv-mistralai/mistral-nemo-12b`）其 `/playground` 页把 `nvcfFunctionId` 渲染为 `"None"`——function-id 只在运行时解析，抓不到。需要在真实页面里驱动一下才能补全（`moonshotai/kimi-k2.6` 即以此方式补入）。
+未纳入的模型（如 `ibm/granite-*-code-instruct`、`nv-mistralai/mistral-nemo-12b`、`moonshotai/kimi-k2.6`）其 `/playground` 页把 `nvcfFunctionId` 渲染为 `"None"`——function-id 只在真实页面运行时解析，静态抓取拿不到。**不要**给这些模型 pin 第三方来源的 function-id（实测会被上游以 `"Cannot parse function_id with value None"` 拒绝）；要让它们可用，需要在真实浏览器里驱动页面拿到运行时 function-id 后再加进注册表。
 
 ### 认证机制
 

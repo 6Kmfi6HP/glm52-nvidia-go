@@ -53,11 +53,14 @@ const DefaultModel = "z-ai/glm-5.2"
 // Models is the registry of all supported build.nvidia.com playground models.
 // Generated from scripts/playground_models.json via scripts/scrape_playground_models.py.
 //
-// Note: a few playground pages render nvcfFunctionId as "None" (the function id
-// is resolved at runtime rather than inlined). Those that have a verified
-// runtime function id are included here (e.g. moonshotai/kimi-k2.6); the
-// remainder (ibm/granite-{34b,8b}-code-instruct, nv-mistralai/mistral-nemo-12b)
-// are absent until their runtime ids are captured.
+// Note: a few playground pages render nvcfFunctionId as "None" — their function
+// id is resolved by the page at runtime (an extra NVCF lookup gated behind the
+// hCaptcha flow) and is NOT in a static fetch. Those models are deliberately
+// absent from this map: pinning an unverified function id (we tried this with
+// moonshotai/kimi-k2.6 using a value from a third-party doc, and the upstream
+// rejected it with "Cannot parse function_id with value None") only pretends
+// to support them. The skipped set as of the last scrape, resolved at runtime,
+// is logged by scripts/scrape_playground_models.py.
 //
 // Function ids are almost always unique per model, but NVIDIA aliases some
 // backend versions to one NVCF function — e.g. nvidia/ising-calibration-1-35b-a3b
@@ -88,7 +91,6 @@ var Models = map[string]ModelInfo{
 	"mistralai/mistral-medium-3.5-128b":             {Slug: "mistral-medium-3.5-128b", Namespace: Namespace, FunctionID: "2dedb559-9b17-4038-b4ad-e79e5e27d84f"},
 	"mistralai/mistral-nemotron":                    {Slug: "mistral-nemotron", Namespace: Namespace, FunctionID: "f81394d8-63c0-4023-afa2-7ad11aa54ca3"},
 	"mistralai/mistral-small-4-119b-2603":           {Slug: "mistral-small-4-119b-2603", Namespace: Namespace, FunctionID: "a9343856-38cc-453f-9e65-3f8c856d0555"},
-	"moonshotai/kimi-k2.6":                          {Slug: "kimi-k2.6", Namespace: Namespace, FunctionID: "23d4f03a-b8a6-4adb-a183-7daa083a09cc"},
 	"nvidia/cosmos-reason2-8b":                      {Slug: "cosmos-reason2-8b", Namespace: Namespace, FunctionID: "24a385c8-111a-4294-8c73-cf7575cc2595"},
 	"nvidia/ising-calibration-1-35b-a3b":            {Slug: "ising-calibration-1-35b-a3b", Namespace: Namespace, FunctionID: "499210d3-3bf7-44bf-88b5-9460edfa8a38"},
 	"nvidia/ising-calibration-1.5-31b":              {Slug: "ising-calibration-1.5-31b", Namespace: Namespace, FunctionID: "499210d3-3bf7-44bf-88b5-9460edfa8a38"},

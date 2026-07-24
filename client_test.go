@@ -121,9 +121,9 @@ func TestBuildRequestRoutesPerModel(t *testing.T) {
 			"https://api.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/glm-5.2",
 			"3b9748d8-1d85-40e8-8573-0eeaa63a4b63",
 		},
-		"moonshotai/kimi-k2.6": {
-			"https://api.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/kimi-k2.6",
-			"23d4f03a-b8a6-4adb-a183-7daa083a09cc",
+		"deepseek-ai/deepseek-v4-pro": {
+			"https://api.ngc.nvidia.com/v2/predict/models/qc69jvmznzxy/deepseek-v4-pro",
+			"74f02205-c7ba-438f-b81a-2537955bd7ec",
 		},
 	}
 	for model, want := range cases {

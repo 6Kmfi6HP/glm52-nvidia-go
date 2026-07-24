@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "count": 53,
+    "count": 52,
     "namespaces": [
       "qc69jvmznzxy"
     ]
@@ -197,14 +197,6 @@
       "function_id": "a9343856-38cc-453f-9e65-3f8c856d0555",
       "ok": true,
       "source": "html"
-    },
-    {
-      "model": "moonshotai/kimi-k2.6",
-      "slug": "kimi-k2.6",
-      "namespace": "qc69jvmznzxy",
-      "function_id": "23d4f03a-b8a6-4adb-a183-7daa083a09cc",
-      "ok": true,
-      "source": "override"
     },
     {
       "model": "nvidia/cosmos-reason2-8b",
